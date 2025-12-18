@@ -1,5 +1,8 @@
 import numpy as np
 from matplotlib import pyplot as plt
+import plotly.graph_objects as go
+import plotly.io as pio
+pio.templates.default = "plotly_white"
 def visualize_pems_tuple(
     datamodule: 'PeMS08DataModule',
     stage= 'train',
@@ -7,16 +10,9 @@ def visualize_pems_tuple(
     sensor_index: int = 0,
 ):
     """
-    Visualisiert das t0-Eingabefenster (mit allen V augmentierten Views), 
-    das t1-Fenster (falls im Dataset enthalten) und das Target-Fenster.
+    Visualisiert die drei Eingabefenster (t-1, t0, t+1) und das Target-Fenster.
     """
-    
-    # 1. Daten vorbereiten und Setup durchführen
-    datamodule.prepare_data()
-    datamodule.setup(stage=stage)
-    
     dataloader = datamodule.train_dataloader() if stage == 'train' else datamodule.val_dataloader()
-    
     # 2. Den ersten Batch abrufen
     try:
         views_batch, target_batch = next(iter(dataloader))
@@ -31,95 +27,42 @@ def visualize_pems_tuple(
     # Extrahiere Parameter
     L_in = datamodule.cfg.window_size
     L_target = datamodule.cfg.target_window_size
-    V_config = datamodule.cfg.V
+    temporal_shift = getattr(datamodule.cfg, "temporal_shift",0)
 
-    # Ermittle, ob t1-Fenster vorhanden sind (relevant für Training)
-    is_t1_present = datamodule.train_ds.t1_window if stage == 'train' else datamodule.val_ds.t1_window
-    
-    total_views_in_batch = views_batch.size(1) 
-    num_views_per_window = V_config # Die Anzahl der Views, die pro Fenster (t0/t1) generiert wurden
-    
     print(f"--- Visualisierung ({stage}-Daten) ---")
-    print(f"Fensterlängen: T0/T1={L_in}, Target={L_target}. | Views pro Fenster (V): {num_views_per_window}. | T1 enthalten: {is_t1_present}.")
-    print(f"Tatsächliche Anzahl Views im Batch: {total_views_in_batch}")
+    print(f"Fensterlängen: L_in={L_in}, Target={L_target}. | Temporal Shift: {temporal_shift}")
     
     # 3. Visualisierung
-    plt.figure(figsize=(14, 6))
+    fig = go.Figure()
     
-    colors_t0 = plt.cm.Blues(np.linspace(0.4, 0.8, num_views_per_window))
-    colors_t1 = plt.cm.Reds(np.linspace(0.4, 0.8, num_views_per_window))
+    # base_start in the dataset is temporal_shift.
+    # In the visualization, we can set t0 start to 0 for convenience.
+    # Then t-1 starts at -temporal_shift, and t+1 starts at +temporal_shift.
     
-    # --- Plot t0 Views ---
-    t0_views_end = num_views_per_window
-    
-    # Slice für t0-Views: von 0 bis V
-    t0_views = views_batch[batch_index, 0:t0_views_end, sensor_index, :].cpu().numpy()
-    time_t0 = np.arange(L_in)
-    
-    if len(t0_views) == 0:
-        print("WARNUNG: Keine T0-Views gefunden. Kann nicht visualisiert werden.")
-        return
+    time_prev = np.arange(-temporal_shift, -temporal_shift + L_in)
+    time_curr = np.arange(0, L_in)
+    time_next = np.arange(temporal_shift, temporal_shift + L_in)
+    time_target = np.arange(L_in, L_in + L_target)
 
-    for i, view in enumerate(t0_views):
-        label = f'T0 View {i+1} (Augmented)'
-        plt.plot(time_t0, view, label=label, color=colors_t0[i % len(colors_t0)], alpha=0.7, linewidth=1.0)
-    
-    # --- Plot t1 Views (falls vorhanden) ---
-    t1_views = np.array([]) # Standardmäßig leeres Array
-    if is_t1_present:
-        t1_views_start = num_views_per_window
-        
-        # Slice für t1-Views: von V bis total_views
-        t1_views = views_batch[batch_index, t1_views_start:total_views_in_batch, sensor_index, :].cpu().numpy()
-        
-        if len(t1_views) > 0:
-            time_t1 = np.arange(L_in, L_in + L_in)
-            
-            for i, view in enumerate(t1_views):
-                label = f'T1 View {i+1} (Augmented)'
-                plt.plot(time_t1, view, label=label, color=colors_t1[i % len(colors_t1)], alpha=0.7, linestyle='--', linewidth=1.0)
-                
-            # Vertikale Linie zwischen t0 und t1
-            plt.axvline(x=L_in - 0.5, color='green', linestyle=':', label='Ende T0 / Start T1')
-            target_start_time = L_in + L_in # Target beginnt nach t1
-        else:
-            # Falls t1_window=True, aber keine t1-Daten im Batch
-            print("WARNUNG: T1-Fenster erwartet, aber keine T1-Views im Batch gefunden.")
-            target_start_time = L_in # Target beginnt nach t0
-    else:
-        # Falls t1_window=False
-        target_start_time = L_in # Target beginnt nach t0
-        
-    # Vertikale Linie nach dem letzten Input-Fenster (entweder t0 oder t1)
-    plt.axvline(x=target_start_time - 0.5, color='red', linestyle=':', label='Ende Input / Start Target')
+    # target_batch shape: [B, L_target, C] (transposed in dataset)
+    v_prev = views_batch[batch_index, 0, sensor_index, :].cpu().numpy()
+    v_curr = views_batch[batch_index, 1, sensor_index, :].cpu().numpy()
+    v_next = views_batch[batch_index, 2, sensor_index, :].cpu().numpy()
+    target = target_batch[batch_index, :, sensor_index].cpu().numpy()
 
+    fig.add_trace(go.Scatter(x=time_prev, y=v_prev, name='T-1 (Shifted Back)', line=dict(color='blue', width=2, dash='dash'), opacity=0.5))
+    fig.add_trace(go.Scatter(x=time_curr, y=v_curr, name='T0 (Reference)', line=dict(color='green', width=2), opacity=0.8))
+    fig.add_trace(go.Scatter(x=time_next, y=v_next, name='T+1 (Shifted Forward)', line=dict(color='red', width=2, dash='dash'), opacity=0.5))
+    
+    fig.add_trace(go.Scatter(x=time_target, y=target, name='Target (Future of T0)', line=dict(color='black', width=2, dash='dash'), opacity=0.5))
 
-    # --- Plot Target Window ---
-    target_sample = target_batch[batch_index, sensor_index, :].cpu().numpy()
-    time_target = np.arange(target_start_time, target_start_time + L_target)
-    
-    plt.plot(time_target, target_sample, label=f'Target (Clean/Unaugmented)', color='black', marker='o', markersize=3, linewidth=2.0)
-    
-    # 4. Verbindung zur letzten Zeitreihe
-    # Die letzte View zum Target verbinden
-    if len(t1_views) > 0:
-        last_view_data = t1_views[-1] 
-    elif len(t0_views) > 0:
-        last_view_data = t0_views[-1]
-    else:
-        last_view_data = None # Sollte durch die frühere Prüfung abgefangen werden
+    # Vertikale Linien für Fenster-Grenzen
+    fig.add_vline(x=0, line_color='gray', line_width=2, line_dash='dash', opacity=0.3, annotation_text='Start T0')
+    fig.add_vline(x=L_in, line_color='red', line_width=2, line_dash='dash', opacity=0.5, annotation_text='Ende T0 / Start Target')
 
-    if last_view_data is not None:
-        plt.plot([target_start_time-1, target_start_time], 
-                 [last_view_data[-1], target_sample[0]], 
-                 color='black', linestyle='--', linewidth=1.0, alpha=0.6)
-    
     # 5. Titel und Achsenbeschriftungen
-    plt.title(f'PeMS-Zeitreihe: Augmentierte T0/T1 Views und Target (Sensor {sensor_index}, Stage: {stage.upper()})')
-    plt.xlabel('Zeitschritt')
-    plt.ylabel('Skalierter Verkehrsfluss')
+    fig.update_layout(title=f'PeMS-Zeitreihe: Multi-Timestamp Views (Sensor {sensor_index}, Stage: {stage.upper()})',
+                      xaxis_title='Relativer Zeitschritt (t0 Start = 0)',
+                      yaxis_title='Skalierter Verkehrsfluss')
     
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.tight_layout(rect=[0, 0, 0.85, 1])
-    plt.show()
+    fig.show()

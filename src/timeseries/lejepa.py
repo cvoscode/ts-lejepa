@@ -11,7 +11,7 @@ try:
     have_lejepa = True
 except Exception:
     have_lejepa = False
-
+print(f"LeJEPA available: {have_lejepa}")
 class TemporalSIGReg(nn.Module):
     """
     Vectorized SIGReg adapted for temporal embeddings.
@@ -82,17 +82,18 @@ class TemporalSIGReg(nn.Module):
 
 
 class LeJEPA_Forecaster(L.LightningModule):
+
     def __init__(self, encoder_backbone, input_dim, horizon,
-                 proj_dim=128, num_slices=1024, lamb=0.5, lr=1e-3):
+                 proj_dim=128, num_slices=1024, lamb=0.5, lr=1e-3,
+                 scaler_mean=None, scaler_std=None):
         super().__init__()
         self.save_hyperparameters(ignore=['encoder_backbone'])
         self.backbone = encoder_backbone                 # encoder should accept windows and return [B, T, D] or [B, D]
         self.backbone_out = getattr(encoder_backbone, "output_dim", None)
         if self.backbone_out is None:
-            raise ValueError("encoder_backbone must expose .output_dim (dim of embedding per token / pooled).")
+            raise ValueError("encoder_backbone must expose .output_dim")
 
-        # projector: map backbone outputs to proj_dim (use LayerNorm-friendly MLP)
-        # design: if backbone returns a sequence [B, T, D] we will project per time-step
+        # Projector: map backbone outputs to proj_dim
         self.proj = nn.Sequential(
             nn.LayerNorm(self.backbone_out),
             nn.Linear(self.backbone_out, 512),
@@ -100,31 +101,50 @@ class LeJEPA_Forecaster(L.LightningModule):
             nn.Linear(512, proj_dim)
         )
 
-        # predictor: map context projected embeddings -> target projected embeddings
+        # Predictor: map context projected embeddings -> target projected embeddings
         self.predictor = nn.Sequential(
             nn.Linear(proj_dim, 512),
             nn.GELU(),
             nn.Linear(512, proj_dim)
         )
 
-        # SIGReg: prefer using lejepa implementation if available
+        # SIGReg Setup
         if have_lejepa:
-            # example usage: SlicingUnivariateTest(univariate_test=EppsPulley(...), num_slices=num_slices)
             from lejepa.univariate import EppsPulley
             self.sigreg = SlicingUnivariateTest(univariate_test=EppsPulley(num_points=17), num_slices=num_slices)
         else:
             self.sigreg = TemporalSIGReg(feature_dim=proj_dim, num_slices=num_slices, A_dim=256)
 
-        # forecasting head: map pooled context embedding to horizon values (you may want to use autoregressive)
+        # Forecasting head
         self.forecast_head = nn.Sequential(
             nn.Linear(self.backbone_out, 256),
             nn.GELU(),
-            nn.Linear(256, horizon * input_dim)
+            nn.Linear(256, input_dim*horizon)
         )
         self.horizon = horizon
         self.input_dim = input_dim
         self.lr = lr
         self.lamb = lamb
+
+        # Scaler parameters for unscaled metrics
+        if scaler_mean is not None and scaler_std is not None:
+            # Expect [1, C, 1] shape from TorchStandardScaler
+            self.register_buffer("scaler_mean", scaler_mean)
+            self.register_buffer("scaler_std", scaler_std)
+        else:
+            self.scaler_mean = None
+            self.scaler_std = None
+
+    def forward(self, x):
+        """Standard forward pass: encode a single window or multiple views."""
+        # If x is [B, C, L], just encode it
+        # If x is [B, V, C, L], we typically want to encode the current view (V=1) or mean of views
+        if x.ndim == 4:
+            B, V, C, L = x.shape
+            x = x.view(B * V, C, L)
+            emb = self.backbone(x)
+            return emb.view(B, V, -1)
+        return self.backbone(x)
 
     def encode_window(self, window):
         """
@@ -138,72 +158,97 @@ class LeJEPA_Forecaster(L.LightningModule):
     def shared_step(self, batch, batch_idx, mode="train"):
         """
         Expect dataset to return:
-          context_window: [B, ...] (past)
-          target_window:  [B, ...] (future window we want to predict)
-          y_true: actual future numeric targets used for supervised MSE (optional)
+          views: [B, V, C, L] (in our case V=3: t-1, t0, t+1)
+          y_true: [B, C, L_target] (actual future numeric targets)
         """
-        context_windows, target_windows, y_true = batch
+        views, y_true = batch
+        B, V, C, L = views.shape
 
-        # 1) encode context and target with same encoder (shared weights)
-        emb_context = self.encode_window(context_windows)  # [B, T_c, D] or [B, D]
-        emb_target  = self.encode_window(target_windows)   # [B, T_t, D] or [B, D]
+        # 1) Encode all views
+        # views: [B, V, C, L] -> flatten batch and view dimensions for encoder
+        views_flat = views.view(B * V, C, L)
+        emb_all = self.encode_window(views_flat)  # [B*V, D] or [B*V, T, D]
 
-        # project to JEPA latent per time-step (if seq) or single pooled vector
-        # if emb_* is [B, T, D] then project per time-step -> [B, T, P]
         def project(emb):
             if emb.dim() == 3:
-                B, T, D = emb.shape
-                emb_flat = emb.reshape(-1, D)
-                z_flat = self.proj(emb_flat)            # [B*T, P]
-                return z_flat.view(B, T, -1)           # [B, T, P]
+                BV, T, D = emb.shape
+                emb_reshape = emb.reshape(-1, D)
+                z_flat = self.proj(emb_reshape)
+                return z_flat.view(BV, T, -1)
             else:
-                return self.proj(emb)                  # [B, P]
+                return self.proj(emb)
 
-        z_context = project(emb_context)
-        z_target  = project(emb_target)
-
-        # 2) JEPA predictive loss: predict target proj from context proj.
-        # Strategy: pool context (mean/attn or last token) and predict pooled target, or predict sequence -> I show pooled strategy for clarity.
-        if z_context.dim() == 3:
-            pooled_ctx = z_context.mean(dim=1)   # [B, P]  (alternative: attentive pooling)
+        z_all = project(emb_all)  # [B*V, P] or [B*V, T, P]
+        
+        # Pool if needed
+        if z_all.dim() == 3:
+            pooled_all = z_all.mean(dim=1)  # [B*V, P]
         else:
-            pooled_ctx = z_context               # [B, P]
+            pooled_all = z_all  # [B*V, P]
+            
+        # Reshape back to [B, V, P]
+        pooled_views = pooled_all.view(B, V, -1)
+        z_prev = pooled_views[:, 0, :]
+        z_curr = pooled_views[:, 1, :]
+        z_next = pooled_views[:, 2, :]
 
-        if z_target.dim() == 3:
-            pooled_tgt = z_target.mean(dim=1)    # [B, P]
+        # 2) JEPA Loss: 
+        # a) Consistency loss: t-1, t0, t+1 should be similar in embedding space
+        # We can use MSE or SIGReg on these.
+        temp_inv_loss = (F.mse_loss(z_prev, z_curr) + F.mse_loss(z_next, z_curr)) * 0.5
+        
+        # b) Predictive loss: predict "something" from t0. 
+        # In JEPA, we usually predict a target representation. 
+        # Since we don't have a "target" window in the input views (except y_true which is raw),
+        # we can either:
+        # 1. Predict z_curr from z_prev? 
+        # 2. Predict a future embedding if we had one.
+        # User goal: "get the model to embedd t-1,t0,t+1 at a similar position"
+        # So consistency loss is key.
+        
+        pred_curr = self.predictor(z_prev)
+        pred_next = self.predictor(z_curr)
+        loss_pred = F.mse_loss(pred_curr, z_curr)
+        loss_pred += F.mse_loss(pred_next, z_next)
+
+        # 3) SIGReg regularization: apply to the *set* of embeddings
+        loss_sigreg = self.sigreg(z_all)
+
+        # 4) Supervised forecast: decode from t0 backbone
+        # Get t0 backbone embeddings [B, D] or [B, T, D]
+        if emb_all.dim() == 3:
+            emb_t0 = emb_all.view(B, V, -1, self.backbone_out)[:, 1, :, :]
+            pooled_t0 = emb_t0.mean(dim=1)
         else:
-            pooled_tgt = z_target                # [B, P]
+            emb_t0 = emb_all.view(B, V, -1)[:, 1, :]
+            pooled_t0 = emb_t0
 
-        pred_tgt = self.predictor(pooled_ctx)    # [B, P]
-        loss_pred = F.mse_loss(pred_tgt, pooled_tgt)
-
-        # 3) SIGReg regularization: apply to the *set* of embeddings we want to regularize.
-        # Combine many embeddings: stack pooled targets (or all projected vectors)
-        if z_target.dim() == 3:
-            sig_input = z_target.reshape(-1, z_target.size(-1))  # [B*T, P]
-        else:
-            sig_input = pooled_tgt                               # [B, P]
-
-        # if using lejepa package, the API accepts embeddings [N, D]; else our TemporalSIGReg also accepts [N, D]
-        loss_sigreg = self.sigreg(sig_input)
-
-        # 4) supervised forecast (if y_true provided). decode from pooled context or use sequence decoder.
-        # Here we decode from pooled backbone (emb_context could be pooled from encoder output)
-        if emb_context.dim() == 3:
-            pooled_backbone = emb_context.mean(dim=1)
-        else:
-            pooled_backbone = emb_context
-
-        y_pred = self.forecast_head(pooled_backbone).view(-1, self.horizon, self.input_dim)
+        y_pred = self.forecast_head(pooled_t0).view(-1, self.input_dim, self.horizon)
+        
+        # Ensure y_true is [B, C, L] for loss calculation
+        if y_true.shape[1] == self.horizon and y_true.shape[2] == self.input_dim:
+            y_true = y_true.transpose(1, 2)
+            
         loss_forecast = F.mse_loss(y_pred, y_true)
-        loss_ssl = loss_pred*(1 - self.lamb) + self.lamb * loss_sigreg
+        
+        loss_ssl = (loss_pred + temp_inv_loss) * (1 - self.lamb) + self.lamb * loss_sigreg
         total_loss = loss_forecast + 0.1 * loss_ssl
 
         # logs
         self.log(f"{mode}/total_loss", total_loss, prog_bar=True)
         self.log(f"{mode}/mse_forecast", loss_forecast)
-        self.log(f"{mode}/jepar_pred", loss_pred)
+        self.log(f"{mode}/pred_loss", loss_pred)
+        self.log(f"{mode}/temp_inv_loss", temp_inv_loss)
         self.log(f"{mode}/sigreg", loss_sigreg)
+
+        # Unscaled MAE for validation/test
+        if mode in ["val", "test"] and self.scaler_mean is not None and self.scaler_std is not None:
+            # y_pred, y_true are [B, H, C]
+            # self.scaler_mean/std are [1, 1, C]
+            y_pred_unscaled = y_pred * self.scaler_std + self.scaler_mean
+            y_true_unscaled = y_true * self.scaler_std + self.scaler_mean
+            mae_unscaled = F.l1_loss(y_pred_unscaled, y_true_unscaled)
+            self.log(f"{mode}/mae_unscaled", mae_unscaled, prog_bar=True)
 
         return total_loss
 
@@ -221,3 +266,29 @@ class LeJEPA_Forecaster(L.LightningModule):
                                                        total_steps=self.trainer.estimated_stepping_batches)
             return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
         return opt
+
+    @property
+    def scaler(self):
+        """Returns an object with inverse_transform method using stored mean/std."""
+        if not hasattr(self, "scaler_mean"):
+            return None
+        
+        class SimpleScaler:
+            def __init__(self, mean, std):
+                self.mean = mean
+                self.std = std
+            def inverse_transform(self, x):
+                # x shape: [B, C, L] or [B, L, C]
+                # self.mean shape: [1, C, 1]
+                if x.shape[1] == self.mean.shape[1]: # [B, C, L]
+                    return x * self.std + self.mean
+                # Fallback for [B, L, C] if needed
+                return x * self.std.transpose(1, 2) + self.mean.transpose(1, 2)
+
+        return SimpleScaler(self.scaler_mean, self.scaler_std)
+
+    def probe(self, emb):
+        """Standard interface for forecasting probe used by callbacks."""
+        B = emb.shape[0]
+        yhat = self.forecast_head(emb)
+        return yhat.view(B, self.input_dim, self.horizon)

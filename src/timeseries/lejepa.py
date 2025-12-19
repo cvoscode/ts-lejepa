@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 from torchvision.ops import MLP
+from .models.covariate import FutureCovariateEncoder
 
 # optional: prefer using official lejepa if installed (recommended)
 try:
@@ -85,13 +86,18 @@ class LeJEPA_Forecaster(L.LightningModule):
 
     def __init__(self, encoder_backbone, input_dim, horizon,
                  proj_dim=128, num_slices=1024, lamb=0.5, lr=1e-3,
-                 scaler_mean=None, scaler_std=None):
+                 scaler_mean=None, scaler_std=None,
+                 use_covariates=False, num_time_features=6):
         super().__init__()
         self.save_hyperparameters(ignore=['encoder_backbone'])
         self.backbone = encoder_backbone                 # encoder should accept windows and return [B, T, D] or [B, D]
         self.backbone_out = getattr(encoder_backbone, "output_dim", None)
         if self.backbone_out is None:
             raise ValueError("encoder_backbone must expose .output_dim")
+        
+        # Covariate handling
+        self.use_covariates = use_covariates
+        self.num_time_features = num_time_features
 
         # Projector: map backbone outputs to proj_dim
         self.proj = nn.Sequential(
@@ -116,12 +122,25 @@ class LeJEPA_Forecaster(L.LightningModule):
         else:
             self.sigreg = TemporalSIGReg(feature_dim=proj_dim, num_slices=num_slices, A_dim=256)
 
+        # Future covariate encoder (for known future time features)
+        if use_covariates:
+            self.future_cov_encoder = FutureCovariateEncoder(
+                input_features=num_time_features, 
+                hidden_dim=32, 
+                output_dim=64
+            )
+            forecast_input_dim = self.backbone_out + self.future_cov_encoder.output_dim
+        else:
+            self.future_cov_encoder = None
+            forecast_input_dim = self.backbone_out
+
         # Forecasting head
         self.forecast_head = nn.Sequential(
-            nn.BatchNorm1d(self.backbone_out),
-            nn.Linear(self.backbone_out, proj_dim*2),
+            nn.BatchNorm1d(forecast_input_dim),
+            nn.Dropout(0.25),
+            nn.Linear(forecast_input_dim, proj_dim*2),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.25),
             nn.Linear(proj_dim*2, proj_dim),
             nn.GELU(),
             nn.Linear(proj_dim, input_dim*horizon)
@@ -140,39 +159,64 @@ class LeJEPA_Forecaster(L.LightningModule):
             self.scaler_mean = None
             self.scaler_std = None
         torch.set_float32_matmul_precision('high')
-    def forward(self, x):
+    def forward(self, x, time_features=None):
         """Standard forward pass: encode a single window or multiple views."""
         # If x is [B, C, L], just encode it
         # If x is [B, V, C, L], we typically want to encode the current view (V=1) or mean of views
         if x.ndim == 4:
             B, V, C, L = x.shape
             x = x.view(B * V, C, L)
-            emb = self.backbone(x)
+            
+            if time_features is not None:
+                # Flatten time_features to [B*V, ...]
+                tf_flat = time_features.reshape(B * V, *time_features.shape[2:])
+                emb = self.backbone(x, tf_flat)
+            else:
+                emb = self.backbone(x)
+                
             return emb.view(B, V, -1)
+            
+        if time_features is not None:
+            return self.backbone(x, time_features)
         return self.backbone(x)
 
-    def encode_window(self, window):
+    def encode_window(self, window, time_features=None):
         """
         window: [B, C, T] or [B, T, C] depending on your backbone
+        time_features: Optional temporal covariates
         returns: embeddings per token/time-step [B, T, D] OR pooled [B, D]
-        (maintain consistent shape for your backbone)
         """
-        emb = self.backbone(window)  # assume [B, T, D] or [B, D]
-        return emb
+        if time_features is not None:
+            return self.backbone(window, time_features)
+        return self.backbone(window)
 
     def shared_step(self, batch, batch_idx, mode="train"):
         """
         Expect dataset to return:
           views: [B, V, C, L] (in our case V=3: t-1, t0, t+1)
-          y_true: [B, C, L_target] (actual future numeric targets)
+          y_true: [B, H, C] (actual future numeric targets, transposed)
+          view_times: [B, V, L, 6] - time features for each view (optional)
+          future_times: [B, H, 6] - time features for forecast horizon (optional)
         """
-        views, y_true = batch
+        # Unpack batch - handle both old (2-tuple) and new (4-tuple) format
+        if len(batch) == 4:
+            views, y_true, view_times, future_times = batch
+        else:
+            views, y_true = batch
+            view_times, future_times = None, None
+        
         B, V, C, L = views.shape
 
         # 1) Encode all views
         # views: [B, V, C, L] -> flatten batch and view dimensions for encoder
         views_flat = views.view(B * V, C, L)
-        emb_all = self.encode_window(views_flat)  # [B*V, D] or [B*V, T, D]
+        
+        if view_times is not None:
+            # Flatten view_times [B, V, L, 6] -> [B*V, L, 6]
+            view_times_flat = view_times.reshape(B * V, *view_times.shape[2:])
+            emb_all = self.encode_window(views_flat, view_times_flat)
+        else:
+            emb_all = self.encode_window(views_flat)  # [B*V, D] or [B*V, T, D]
 
         def project(emb):
             if emb.dim() == 3:
@@ -228,7 +272,14 @@ class LeJEPA_Forecaster(L.LightningModule):
             emb_t0 = emb_all.view(B, V, -1)[:, 1, :]
             pooled_t0 = emb_t0
 
-        y_pred = self.forecast_head(pooled_t0.detach()).view(-1, self.input_dim, self.horizon)
+        # Forecast with optional future covariate conditioning
+        if self.use_covariates and future_times is not None:
+            future_cov_emb = self.future_cov_encoder(future_times)  # [B, 64]
+            forecast_input = torch.cat([pooled_t0.detach(), future_cov_emb], dim=-1)
+        else:
+            forecast_input = pooled_t0.detach()
+        
+        y_pred = self.forecast_head(forecast_input).view(-1, self.input_dim, self.horizon)
         
         # Ensure y_true is [B, C, L] for loss calculation
         if y_true.shape[1] == self.horizon and y_true.shape[2] == self.input_dim:
@@ -294,7 +345,7 @@ class LeJEPA_Forecaster(L.LightningModule):
     @property
     def scaler(self):
         """Returns an object with inverse_transform method using stored mean/std."""
-        if not hasattr(self, "scaler_mean"):
+        if not hasattr(self, "scaler_mean") or self.scaler_mean is None:
             return None
         
         class SimpleScaler:
@@ -311,8 +362,15 @@ class LeJEPA_Forecaster(L.LightningModule):
 
         return SimpleScaler(self.scaler_mean, self.scaler_std)
 
-    def probe(self, emb):
+    def probe(self, emb, future_times=None):
         """Standard interface for forecasting probe used by callbacks."""
         B = emb.shape[0]
-        yhat = self.forecast_head(emb)
+        
+        if self.use_covariates and future_times is not None:
+            future_cov_emb = self.future_cov_encoder(future_times)
+            forecast_input = torch.cat([emb, future_cov_emb], dim=-1)
+        else:
+            forecast_input = emb
+            
+        yhat = self.forecast_head(forecast_input)
         return yhat.view(B, self.input_dim, self.horizon)

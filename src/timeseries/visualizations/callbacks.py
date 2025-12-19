@@ -40,17 +40,24 @@ class VisualizationCallback(L.Callback):
                 if i >= self.num_umap_batches:
                     break
                 
-                # Batch extraction: (views, target)
-                # target shape: [B, C, L_target]
-                # views shape: [B, V, C, L_input]
-                vs, target = batch
+                # Batch extraction: handle both old (2-tuple) and new (4-tuple) format
+                if len(batch) == 4:
+                    vs, target, view_times, future_times = batch
+                else:
+                    vs, target = batch
+                    view_times, future_times = None, None
+                    
                 vs = vs.to(device)
                 target = target.to(device)
+                if view_times is not None:
+                    view_times = view_times.to(device)
+                if future_times is not None:
+                    future_times = future_times.to(device)
                 
                 # Forward Pass
                 # Use only the first view for inference in val mode
                 # The model might return (emb, proj). We only need emb.
-                out = pl_module(vs)
+                out = pl_module(vs, time_features=view_times)
                 if isinstance(out, tuple):
                     emb = out[0]
                 else:
@@ -66,7 +73,7 @@ class VisualizationCallback(L.Callback):
                 else:
                     emb_flat = emb 
 
-                yhat = pl_module.probe(emb_flat)
+                yhat = pl_module.probe(emb_flat, future_times=future_times)
                 
                 # Collect embeddings for UMAP
                 all_embeddings.append(emb_flat.cpu().numpy())

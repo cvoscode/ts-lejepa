@@ -15,7 +15,13 @@ def visualize_pems_tuple(
     dataloader = datamodule.train_dataloader() if stage == 'train' else datamodule.val_dataloader()
     # 2. Den ersten Batch abrufen
     try:
-        views_batch, target_batch = next(iter(dataloader))
+        batch = next(iter(dataloader))
+        # Handle both old (2-tuple) and new (4-tuple) batch formats
+        if len(batch) == 4:
+            views_batch, target_batch, view_times_batch, future_times_batch = batch
+        else:
+            views_batch, target_batch = batch
+            view_times_batch, future_times_batch = None, None
     except (StopIteration, Exception) as e:
         print(f"Fehler beim Laden des Batches: {e}")
         return

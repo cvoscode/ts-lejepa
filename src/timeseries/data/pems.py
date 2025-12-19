@@ -13,6 +13,7 @@ from typing import Optional, List
 from omegaconf import DictConfig
 from ..augementation.v1 import TimeSeriesTransform
 from ..preprocessing.scalers import TorchStandardScaler
+from ..preprocessing.time_encoding import encode_timestamps_torch, NUM_TIME_FEATURES
 from dataclasses import dataclass
 
 def download_url(url: str, root_dir: str) -> str:
@@ -69,6 +70,7 @@ class PeMS08:
         fp.close()
         index = pd.date_range(start=self.start_date, periods=len(data), freq='5min')
         self.target = pd.DataFrame(data[..., 0], index=index, dtype='float32')
+        self.timestamps = index  # Store for time encoding
         distances = pd.read_csv(dist_path)
         self.dist = np.full((self.num_sensors, self.num_sensors), np.inf, dtype=np.float32)
         for src, dst, d in distances.values:
@@ -96,9 +98,21 @@ class PeMS08:
         return self.edge_index.to(device), self.edge_weight.to(device)
 
 class PeMS08AugmentedDataset(Dataset):
-    def __init__(self, pems08: torch.Tensor, transform, window_size: int = 512, target_window_size: int = 12, temporal_shift: int = 10, stride: int = 1, sensors=None):
+    def __init__(self, pems08: torch.Tensor, time_features: torch.Tensor, transform, window_size: int = 512, target_window_size: int = 12, temporal_shift: int = 10, stride: int = 1, sensors=None):
+        """
+        Args:
+            pems08: Sensor data tensor [C, T]
+            time_features: Time encoding tensor [T, 6] with cyclical features
+            transform: Augmentation transform for sensor data
+            window_size: Length of input windows
+            target_window_size: Forecast horizon
+            temporal_shift: Shift between t-1, t0, t+1 views
+            stride: Stride for sliding window
+            sensors: List of sensor indices to use (None = all)
+        """
         super().__init__()
         self.data = pems08
+        self.time_features = time_features  # [T, 6]
         self.C, self.T = self.data.shape
         self.window_size = window_size
         self.target_window_size = target_window_size
@@ -116,6 +130,8 @@ class PeMS08AugmentedDataset(Dataset):
 
     def __getitem__(self, idx):
         base_start = self.temporal_shift + (idx * self.stride)
+        
+        # Sensor data windows
         start_prev = base_start - self.temporal_shift
         t_prev = self.data[self.sensors, start_prev : start_prev + self.window_size]
         t_curr = self.data[self.sensors, base_start : base_start + self.window_size]
@@ -123,12 +139,24 @@ class PeMS08AugmentedDataset(Dataset):
         t_next = self.data[self.sensors, start_next : start_next + self.window_size]
         target_start = base_start + self.window_size
         target = self.data[self.sensors, target_start : target_start + self.target_window_size]
+        
+        # Apply transforms to sensor data
         view_prev = self.transform(t_prev.clone())
         view_curr = self.transform(t_curr.clone())
         view_next = self.transform(t_next.clone())
-        views = torch.stack([view_prev, view_curr, view_next])
+        views = torch.stack([view_prev, view_curr, view_next])  # [3, C, L]
+        
+        # Time features for each view window [3, L, 6]
+        time_prev = self.time_features[start_prev : start_prev + self.window_size]
+        time_curr = self.time_features[base_start : base_start + self.window_size]
+        time_next = self.time_features[start_next : start_next + self.window_size]
+        view_times = torch.stack([time_prev, time_curr, time_next])  # [3, L, 6]
+        
+        # Future time features for forecast horizon [H, 6]
+        future_times = self.time_features[target_start : target_start + self.target_window_size]
+        
         # Transpose target to [horizon, channels] -> [12, 170]
-        return views, target.t()
+        return views, target.t(), view_times, future_times
 
 class PeMS08DataModule(L.LightningDataModule):
     def __init__(self, cfg: DictConfig):
@@ -163,22 +191,34 @@ class PeMS08DataModule(L.LightningDataModule):
     def setup(self, stage=None):
         pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
         data = torch.tensor(pems08.target.values, dtype=torch.float32)
-        #temporal split
+        
+        # Generate time features for entire dataset
+        time_features = encode_timestamps_torch(pems08.timestamps)  # [T, 6]
+        
+        # Temporal split
         n_train = int(len(data) * 0.8)
         train_raw = data[:n_train]
         test_raw = data[n_train:]
+        train_time = time_features[:n_train]
+        test_time = time_features[n_train:]
+        
         train_scaled_3d = self.scaler.fit_transform(train_raw)
         test_scaled_3d = self.scaler.transform(test_raw)
         train_scaled_ct = train_scaled_3d.squeeze(0)
         test_scaled_ct = test_scaled_3d.squeeze(0)
+        
         self.train_ds = PeMS08AugmentedDataset(
-            train_scaled_ct, transform=self.aug_transform, window_size=self.cfg.window_size,
-            target_window_size=self.cfg.target_window_size, temporal_shift=getattr(self.cfg, "temporal_shift", 10),
+            train_scaled_ct, train_time, transform=self.aug_transform, 
+            window_size=self.cfg.window_size,
+            target_window_size=self.cfg.target_window_size, 
+            temporal_shift=getattr(self.cfg, "temporal_shift", 10),
             stride=getattr(self.cfg, "stride", 1)
         )
         self.val_ds = PeMS08AugmentedDataset(
-            test_scaled_ct, transform=self.test_transform, window_size=self.cfg.window_size,
-            target_window_size=self.cfg.target_window_size, temporal_shift=getattr(self.cfg, "temporal_shift", 10),
+            test_scaled_ct, test_time, transform=self.test_transform, 
+            window_size=self.cfg.window_size,
+            target_window_size=self.cfg.target_window_size, 
+            temporal_shift=getattr(self.cfg, "temporal_shift", 10),
             stride=getattr(self.cfg, "stride", 1)
         )
 
@@ -187,3 +227,4 @@ class PeMS08DataModule(L.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.val_ds, batch_size=self.cfg.batch_size, shuffle=False, num_workers=getattr(self.cfg, "num_workers", 0))
+

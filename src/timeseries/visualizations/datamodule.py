@@ -45,10 +45,10 @@ def visualize_pems_tuple(
     time_target = np.arange(L_in, L_in + L_target)
 
     # target_batch shape: [B, L_target, C] (transposed in dataset)
-    v_prev = views_batch[batch_index, 0, sensor_index, :].cpu().numpy()
-    v_curr = views_batch[batch_index, 1, sensor_index, :].cpu().numpy()
-    v_next = views_batch[batch_index, 2, sensor_index, :].cpu().numpy()
-    target = target_batch[batch_index, :, sensor_index].cpu().numpy()
+    v_prev = views_batch[batch_index, 0, sensor_index-1, :].cpu().numpy()
+    v_curr = views_batch[batch_index, 1, sensor_index-1, :].cpu().numpy()
+    v_next = views_batch[batch_index, 2, sensor_index-1, :].cpu().numpy()
+    target = target_batch[batch_index, :, sensor_index-1].cpu().numpy()
 
     fig.add_trace(go.Scatter(x=time_prev, y=v_prev, name='T-1 (Shifted Back)', line=dict(color='blue', width=2, dash='dash'), opacity=0.5))
     fig.add_trace(go.Scatter(x=time_curr, y=v_curr, name='T0 (Reference)', line=dict(color='green', width=2), opacity=0.8))

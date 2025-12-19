@@ -163,6 +163,7 @@ class PeMS08DataModule(L.LightningDataModule):
     def setup(self, stage=None):
         pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
         data = torch.tensor(pems08.target.values, dtype=torch.float32)
+        #temporal split
         n_train = int(len(data) * 0.8)
         train_raw = data[:n_train]
         test_raw = data[n_train:]

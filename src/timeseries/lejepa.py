@@ -95,17 +95,18 @@ class LeJEPA_Forecaster(L.LightningModule):
 
         # Projector: map backbone outputs to proj_dim
         self.proj = nn.Sequential(
-            nn.LayerNorm(self.backbone_out),
-            nn.Linear(self.backbone_out, 512),
+            nn.BatchNorm1d(self.backbone_out),
+            nn.Linear(self.backbone_out, proj_dim*2),
+            nn.Dropout(0.1),
             nn.GELU(),
-            nn.Linear(512, proj_dim)
+            nn.Linear(proj_dim*2, proj_dim),
         )
 
         # Predictor: map context projected embeddings -> target projected embeddings
         self.predictor = nn.Sequential(
-            nn.Linear(proj_dim, 512),
+            nn.Linear(proj_dim, proj_dim//2),
             nn.GELU(),
-            nn.Linear(512, proj_dim)
+            nn.Linear(proj_dim//2, proj_dim)
         )
 
         # SIGReg Setup
@@ -117,9 +118,13 @@ class LeJEPA_Forecaster(L.LightningModule):
 
         # Forecasting head
         self.forecast_head = nn.Sequential(
-            nn.Linear(self.backbone_out, 256),
+            nn.BatchNorm1d(self.backbone_out),
+            nn.Linear(self.backbone_out, proj_dim*2),
             nn.GELU(),
-            nn.Linear(256, input_dim*horizon)
+            nn.Dropout(0.1),
+            nn.Linear(proj_dim*2, proj_dim),
+            nn.GELU(),
+            nn.Linear(proj_dim, input_dim*horizon)
         )
         self.horizon = horizon
         self.input_dim = input_dim
@@ -134,7 +139,7 @@ class LeJEPA_Forecaster(L.LightningModule):
         else:
             self.scaler_mean = None
             self.scaler_std = None
-
+        torch.set_float32_matmul_precision('high')
     def forward(self, x):
         """Standard forward pass: encode a single window or multiple views."""
         # If x is [B, C, L], just encode it
@@ -223,7 +228,7 @@ class LeJEPA_Forecaster(L.LightningModule):
             emb_t0 = emb_all.view(B, V, -1)[:, 1, :]
             pooled_t0 = emb_t0
 
-        y_pred = self.forecast_head(pooled_t0).view(-1, self.input_dim, self.horizon)
+        y_pred = self.forecast_head(pooled_t0.detach()).view(-1, self.input_dim, self.horizon)
         
         # Ensure y_true is [B, C, L] for loss calculation
         if y_true.shape[1] == self.horizon and y_true.shape[2] == self.input_dim:
@@ -232,11 +237,12 @@ class LeJEPA_Forecaster(L.LightningModule):
         loss_forecast = F.mse_loss(y_pred, y_true)
         
         loss_ssl = (loss_pred + temp_inv_loss) * (1 - self.lamb) + self.lamb * loss_sigreg
-        total_loss = loss_forecast + 0.1 * loss_ssl
+        total_loss = loss_forecast*0.1 + loss_ssl
 
         # logs
         self.log(f"{mode}/total_loss", total_loss, prog_bar=True)
         self.log(f"{mode}/mse_forecast", loss_forecast)
+        self.log(f"{mode}/loss_ssl", loss_ssl)
         self.log(f"{mode}/pred_loss", loss_pred)
         self.log(f"{mode}/temp_inv_loss", temp_inv_loss)
         self.log(f"{mode}/sigreg", loss_sigreg)
@@ -259,12 +265,30 @@ class LeJEPA_Forecaster(L.LightningModule):
         return self.shared_step(batch, batch_idx, mode="val")
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=1e-2)
-        # OneCycle usage: ensure trainer.estimated_stepping_batches is available at configure time
+        # Group 1: Self-Supervised components (Backbone, Projector, Predictor)
+        ssl_params = (
+            list(self.backbone.parameters()) + 
+            list(self.proj.parameters()) + 
+            list(self.predictor.parameters())
+        )
+        
+        # Group 2: Forecasting Head (The "Probe")
+        forecast_params = list(self.forecast_head.parameters())
+
+        opt = torch.optim.AdamW([
+            {"params": ssl_params, "lr": self.lr, "weight_decay": 5e-2},
+            {"params": forecast_params, "lr": 1e-3, "weight_decay": 1e-7}
+        ])
+
+        # OneCycle usage: ensure trainer.estimated_stepping_batches is available
         if hasattr(self.trainer, "estimated_stepping_batches") and self.trainer.estimated_stepping_batches is not None:
-            sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=self.lr,
-                                                       total_steps=self.trainer.estimated_stepping_batches)
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, 
+                max_lr=[self.lr, 5e-4], # match the max_lr for each group
+                total_steps=self.trainer.estimated_stepping_batches
+            )
             return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        
         return opt
 
     @property

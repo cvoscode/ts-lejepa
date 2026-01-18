@@ -55,25 +55,36 @@ class VisualizationCallback(L.Callback):
                     future_times = future_times.to(device)
                 
                 # Forward Pass
-                # Use only the first view for inference in val mode
-                # The model might return (emb, proj). We only need emb.
-                out = pl_module(vs, time_features=view_times)
-                if isinstance(out, tuple):
-                    emb = out[0]
-                else:
-                    emb = out
+                # Get backbone embeddings from t0 view(s).
+                # Convention: view[0]=t-1, view[1:V-1]=repeated augmented t0 views, view[V-1]=t+1.
+                B, V, C, L = vs.shape
+                if V < 3:
+                    raise ValueError(f"Expected at least 3 views (prev, curr, next). Got V={V}.")
+                vs_flat = vs.reshape(B * V, C, L)
                 
-                # emb shape: [B, V, D] (from pl_module.forward) or [B, D]
-                # We want the first view (usually 'current' t0) for UMAP
-                if emb.ndim == 3: 
-                    # Assuming shape [B, V, D], take the middle view (V=1 is t0)
-                    # or just view 0 if V=1. 
-                    v_idx = emb.shape[1] // 2 
-                    emb_flat = emb[:, v_idx, :] # [B, D]
+                if view_times is not None:
+                    view_times_flat = view_times.reshape(B * V, view_times.shape[2], view_times.shape[3])
+                    emb_all = pl_module._backbone_forward(vs_flat, view_times_flat)
                 else:
-                    emb_flat = emb 
-
-                yhat = pl_module.probe(emb_flat, future_times=future_times)
+                    emb_all = pl_module._backbone_forward(vs_flat)
+                
+                # Get t0 embeddings for UMAP and forecasting
+                if emb_all.dim() == 3:
+                    emb_views = emb_all.view(B, V, -1, pl_module.backbone_out)
+                    emb_t0 = emb_views[:, 1:-1, :, :].mean(dim=1)  # [B, T, D]
+                    emb_flat = emb_t0.mean(dim=1)  # [B, D]
+                else:
+                    emb_views = emb_all.view(B, V, -1)
+                    emb_flat = emb_views[:, 1:-1, :].mean(dim=1)  # [B, D]
+                
+                # Generate forecast
+                if pl_module.use_covariates and future_times is not None:
+                    future_cov_emb = pl_module.future_cov_encoder(future_times)
+                    forecast_input = torch.cat([emb_flat, future_cov_emb], dim=-1)
+                else:
+                    forecast_input = emb_flat
+                
+                yhat = pl_module.forecast_head(forecast_input).view(B, pl_module.input_dim, pl_module.horizon)
                 
                 # Collect embeddings for UMAP
                 all_embeddings.append(emb_flat.cpu().numpy())
@@ -85,8 +96,12 @@ class VisualizationCallback(L.Callback):
                 
                 # Store plot data (only from the first batch)
                 if i == 0:
-                    # Input sequence for View 0
-                    input_seq = vs[:, 0, :, :] 
+                    # Input sequence for t0: average over repeated t0 views
+                    input_seq = vs[:, 1:-1, :, :].mean(dim=1)  # [B, C, L]
+                    
+                    # Ensure target is [B, C, H]
+                    if target.shape[1] == pl_module.horizon and target.shape[2] == pl_module.input_dim:
+                        target = target.transpose(1, 2)
                     
                     # Inverse scaling
                     if hasattr(pl_module, 'scaler') and pl_module.scaler is not None:
@@ -106,15 +121,139 @@ class VisualizationCallback(L.Callback):
 
         # --- A. Plot Predictions ---
         if plot_data is not None:
-            self._plot_predictions(trainer, plot_data)
+            try:
+                self._plot_predictions(trainer, plot_data, step='Validation')
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+        # --- B. Plot UMAP (every N epochs) ---
+        if (trainer.current_epoch + 1) % self.umap_every_n_epochs == 0 and len(all_embeddings) > 0:
+            try:
+                embeddings_concat = np.concatenate(all_embeddings, axis=0)
+                times_concat = np.concatenate(all_times, axis=0)
+                self._plot_umap(trainer, embeddings_concat, times_concat, step='Validation')
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.datamodule is None:
+           
+            return
+        
+        train_loader = trainer.datamodule.train_dataloader()
+        
+        # Containers for UMAP
+        all_embeddings = []
+        all_times = [] # Time index for coloring
+
+        # Container for Prediction Plots (only from the first batch)
+        plot_data = None
+        
+        device = pl_module.device
+        pl_module.eval() # Ensure eval mode
+
+        with torch.no_grad():
+            for i, batch in enumerate(train_loader):
+                if i >= self.num_umap_batches:
+                    break
+                
+                # Batch extraction: handle both old (2-tuple) and new (4-tuple) format
+                if len(batch) == 4:
+                    vs, target, view_times, future_times = batch
+                else:
+                    vs, target = batch
+                    view_times, future_times = None, None
+                    
+                vs = vs.to(device)
+                target = target.to(device)
+                if view_times is not None:
+                    view_times = view_times.to(device)
+                if future_times is not None:
+                    future_times = future_times.to(device)
+                
+                # Forward Pass
+                # Get backbone embeddings from t0 view(s).
+                # Convention: view[0]=t-1, view[1:V-1]=repeated augmented t0 views, view[V-1]=t+1.
+                B, V, C, L = vs.shape
+                if V < 3:
+                    raise ValueError(f"Expected at least 3 views (prev, curr, next). Got V={V}.")
+                vs_flat = vs.reshape(B * V, C, L)
+                
+                if view_times is not None:
+                    view_times_flat = view_times.reshape(B * V, view_times.shape[2], view_times.shape[3])
+                    emb_all = pl_module._backbone_forward(vs_flat, view_times_flat)
+                else:
+                    emb_all = pl_module._backbone_forward(vs_flat)
+                
+                # Get t0 embeddings for UMAP and forecasting
+                if emb_all.dim() == 3:
+                    emb_views = emb_all.view(B, V, -1, pl_module.backbone_out)
+                    emb_t0 = emb_views[:, 1:-1, :, :].mean(dim=1)  # [B, T, D]
+                    emb_flat = emb_t0.mean(dim=1)  # [B, D]
+                else:
+                    emb_views = emb_all.view(B, V, -1)
+                    emb_flat = emb_views[:, 1:-1, :].mean(dim=1)  # [B, D]
+                
+                # Generate forecast
+                if pl_module.use_covariates and future_times is not None:
+                    future_cov_emb = pl_module.future_cov_encoder(future_times)
+                    forecast_input = torch.cat([emb_flat, future_cov_emb], dim=-1)
+                else:
+                    forecast_input = emb_flat
+                
+                yhat = pl_module.forecast_head(forecast_input).view(B, pl_module.input_dim, pl_module.horizon)
+                
+                # Collect embeddings for UMAP
+                all_embeddings.append(emb_flat.cpu().numpy())
+                
+                # Time index simulation
+                batch_size = vs.shape[0]
+                time_indices = np.arange(i * batch_size, (i + 1) * batch_size)
+                all_times.append(time_indices)
+                
+                # Store plot data (only from the first batch)
+                if i == 0:
+                    # Input sequence for t0: average over repeated t0 views
+                    input_seq = vs[:, 1:-1, :, :].mean(dim=1)  # [B, C, L]
+                    
+                    # Ensure target is [B, C, H]
+                    if target.shape[1] == pl_module.horizon and target.shape[2] == pl_module.input_dim:
+                        target = target.transpose(1, 2)
+                    
+                    # Inverse scaling
+                    if hasattr(pl_module, 'scaler') and pl_module.scaler is not None:
+                        input_inv = pl_module.scaler.inverse_transform(input_seq)
+                        target_inv = pl_module.scaler.inverse_transform(target)
+                        yhat_inv = pl_module.scaler.inverse_transform(yhat)
+                    else:
+                        input_inv = input_seq
+                        target_inv = target
+                        yhat_inv = yhat
+                        
+                    plot_data = {
+                        'input': input_inv.cpu(),
+                        'target': target_inv.cpu(),
+                        'prediction': yhat_inv.cpu()
+                    }
+
+        # --- A. Plot Predictions ---
+        if plot_data is not None:
+            
+            self._plot_predictions(trainer, plot_data, step='Train')
+               
+            
 
         # --- B. Plot UMAP (every N epochs) ---
         if (trainer.current_epoch + 1) % self.umap_every_n_epochs == 0 and len(all_embeddings) > 0:
             embeddings_concat = np.concatenate(all_embeddings, axis=0)
             times_concat = np.concatenate(all_times, axis=0)
-            self._plot_umap(trainer, embeddings_concat, times_concat)
+            self._plot_umap(trainer, embeddings_concat, times_concat,step='Train')
+                
+           
 
-    def _plot_predictions(self, trainer, data):
+    def _plot_predictions(self, trainer, data,step):
         """ Creates Matplotlib plots for time series """
         inputs = data['input']      # Expected [B, C, L_in]
         targets = data['target']    # Might be [B, L_out, C] or [B, C, L_out]
@@ -158,13 +297,12 @@ class VisualizationCallback(L.Callback):
             ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        
         # Log to Tensorboard
-        if trainer.logger and hasattr(trainer.logger.experiment, 'add_figure'):
-            trainer.logger.experiment.add_figure("Validation/Predictions", fig, global_step=trainer.global_step)
+        if trainer.logger and hasattr(trainer.logger, 'experiment') and hasattr(trainer.logger.experiment, 'add_figure'):
+            trainer.logger.experiment.add_figure(f"{step}/Predictions", fig, global_step=trainer.global_step)
         plt.close(fig)
 
-    def _plot_umap(self, trainer, embeddings, time_indices):
+    def _plot_umap(self, trainer, embeddings, time_indices,step):
         """ Computes and plots UMAP """
         try:
             # Flatten embeddings if necessary
@@ -184,11 +322,11 @@ class VisualizationCallback(L.Callback):
                 alpha=0.6
             )
             ax.set_title("UMAP of Embeddings (Color = Time Index)")
-            plt.colorbar(scatter, label='Time Index within Validation Subset')
+            plt.colorbar(scatter, label=f'Time Index within {step} Subset')
             ax.grid(True, alpha=0.3)
             
-            if trainer.logger and hasattr(trainer.logger.experiment, 'add_figure'):
-                trainer.logger.experiment.add_figure("Validation/UMAP_Embedding", fig, global_step=trainer.global_step)
+            if trainer.logger and hasattr(trainer.logger, 'experiment') and hasattr(trainer.logger.experiment, 'add_figure'):
+                trainer.logger.experiment.add_figure(f"{step}/UMAP_Embedding", fig, global_step=trainer.global_step)
             plt.close(fig)
             
         except Exception as e:

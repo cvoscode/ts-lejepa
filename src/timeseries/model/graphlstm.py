@@ -110,10 +110,25 @@ class TimeSeriesGraphLSTMEncoder(nn.Module):
                  gnn_hidden_channels: int,
                  encoder_output_dim: int = 12,
                  proj_dim: int = 128,
-                 K: int = 2):
+                 K: int = 2,
+                 edge_index: torch.Tensor | None = None,
+                 edge_weight: torch.Tensor | None = None):
         super().__init__()
 
         self.encoder_output_dim = encoder_output_dim
+        # LeJEPA_Forecaster expects the backbone to expose .output_dim
+        self.output_dim = encoder_output_dim
+
+        # Optional: store graph structure on the module so forward(x) works.
+        # If you don't pass edge_index here, you must pass it to forward(...).
+        if edge_index is not None:
+            self.register_buffer("edge_index", edge_index)
+        else:
+            self.edge_index = None
+        if edge_weight is not None:
+            self.register_buffer("edge_weight", edge_weight)
+        else:
+            self.edge_weight = None
 
         self.encoder = GNN_TimeSeriesEncoder(
             input_channels=1,
@@ -139,7 +154,39 @@ class TimeSeriesGraphLSTMEncoder(nn.Module):
             init.constant_(m.weight, 1)
             init.constant_(m.bias, 0)
 
-    def forward(self, x, edge_index, edge_weight=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_features: torch.Tensor | None = None,
+        *,
+        edge_index: torch.Tensor | None = None,
+        edge_weight: torch.Tensor | None = None,
+        return_proj: bool = False,
+    ):
+        """Encode spatiotemporal windows.
+
+        LeJEPA_Forecaster will call `forward(x, time_features=None)` with x shaped
+        like [B*V, C, T] (or [B, V, C, T] if you call it directly). This model
+        also needs a graph `edge_index`; you can provide it at init or per-call.
+        """
+        _ = time_features  # accepted for API compatibility; not used
+
+        if edge_index is None:
+            edge_index = getattr(self, "edge_index", None)
+        if edge_weight is None:
+            edge_weight = getattr(self, "edge_weight", None)
+        if edge_index is None:
+            raise ValueError("TimeSeriesGraphLSTMEncoder requires edge_index (pass at init or forward(..., edge_index=...)).")
+
+        # Normalize input shapes.
+        if x.dim() == 3:
+            # Treat as [B*V, C, T] with scalar feature per node.
+            BV, C, T = x.shape
+            B, V = BV, 1
+            x = x.view(B, V, C, T)
+        elif x.dim() != 4:
+            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
+
         # x: [B, V, C, T]
         B, V, C, T = x.shape
 
@@ -152,10 +199,18 @@ class TimeSeriesGraphLSTMEncoder(nn.Module):
         #     edge_index, edge_weight, C, Bv, x.device
         # )
         emb_flat = self.encoder(x, edge_index, edge_weight)  # [B*V, D]
-        emb = emb_flat.view(B, V, self.encoder_output_dim).mean(dim=1)
+        # Keep JEPA-consistent semantics:
+        # - if caller provided [B, V, ...], return per-view embeddings as [B, V, D]
+        # - if caller provided [B*V, ...] (V inferred as 1), return [B*V, D]
+        if V == 1:
+            emb = emb_flat
+        else:
+            emb = emb_flat.view(B, V, self.encoder_output_dim)
 
-        proj = self.proj(emb)
-        return emb, proj
+        if return_proj:
+            proj = self.proj(emb_flat)
+            return emb, proj
+        return emb
     # def expand_edge_index(self,edge_index, edge_weight, num_nodes, batch_size, device):
     #     edge_indices = []
     #     edge_weights = []

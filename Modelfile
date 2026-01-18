@@ -1,0 +1,3 @@
+FROM devstral-small-2:latest
+PARAMETER num_ctx 389120
+PARAMETER num_predict -1

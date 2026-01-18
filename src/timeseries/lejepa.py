@@ -6,14 +6,78 @@ import lightning as L
 from torchvision.ops import MLP
 from .models.covariate import FutureCovariateEncoder
 
-# optional: prefer using official lejepa if installed (recommended)
-try:
-    from lejepa.multivariate import SlicingUnivariateTest
-    have_lejepa = True
-except Exception:
-    have_lejepa = False
-print(f"LeJEPA available: {have_lejepa}")
+
+class TemporalVICReg(nn.Module):
+    """
+    VICReg-style regularization adapted for temporal embeddings.
+    
+    Two components (Invariance handled separately by temp_inv_loss):
+    - Variance: prevent collapse by ensuring each dimension has std >= gamma
+    - Covariance: decorrelate dimensions by minimizing off-diagonal covariance
+    
+    Input z: [N_samples, D] where N_samples = B * T
+    Returns scalar loss (variance_loss + mu * covariance_loss)
+    """
+    
+    def __init__(self, feature_dim, gamma=1.0, mu=1.0, eps=1e-4):
+        """
+        Args:
+            feature_dim: Embedding dimension D (for API compatibility)
+            gamma: Target standard deviation threshold (default 1.0)
+            mu: Weight for covariance loss relative to variance loss
+            eps: Small constant for numerical stability
+        """
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.gamma = gamma
+        self.mu = mu
+        self.eps = eps
+    
+    def forward(self, z, global_step: int | None = None, return_components: bool = False):
+        """
+        z: [B, T, D] OR [N, D]; we accept both
+        global_step: Unused, kept for API compatibility with TemporalSIGReg
+        return_components: If True, return dict with var_loss, cov_loss, std_mean
+        returns scalar loss (or dict if return_components=True)
+        """
+        _ = global_step  # Unused, for API compatibility
+        
+        if z.dim() == 3:
+            B, T, D = z.shape
+            z_flat = z.reshape(-1, D)  # [N, D]
+        else:
+            z_flat = z  # [N, D]
+        
+        N, D = z_flat.shape
+        
+        # 1) Variance loss: encourage std of each dimension >= gamma
+        std = z_flat.std(dim=0)  # [D]
+        var_loss = F.relu(self.gamma - std).mean()
+        
+        # 2) Covariance loss: minimize off-diagonal covariance terms
+        z_centered = z_flat - z_flat.mean(dim=0, keepdim=True)
+        cov = (z_centered.T @ z_centered) / (N - 1 + self.eps)  # [D, D]
+        
+        # Zero out diagonal, penalize off-diagonal
+        cov_off_diag = cov - torch.diag(torch.diag(cov))
+        cov_loss = (cov_off_diag ** 2).sum() / D
+        
+        total_loss = var_loss + self.mu * cov_loss
+        
+        if return_components:
+            return {
+                "total": total_loss,
+                "var_loss": var_loss,
+                "cov_loss": cov_loss,
+                "std_mean": std.mean(),  # Diagnostic: average std across dimensions
+                "std_min": std.min(),    # Diagnostic: minimum std (collapse indicator)
+            }
+        return total_loss
+
+
+
 class TemporalSIGReg(nn.Module):
+
     """
     Vectorized SIGReg adapted for temporal embeddings.
 
@@ -27,6 +91,7 @@ class TemporalSIGReg(nn.Module):
         self.num_slices = num_slices
         self.knots = knots
         self.A_dim = A_dim
+        self.seed = seed
 
         # create the univariate test weights (same as LeJEPA: t grid, window, weights)
         t = torch.linspace(0, 3, knots, dtype=torch.float32)
@@ -39,16 +104,22 @@ class TemporalSIGReg(nn.Module):
         self.register_buffer("phi", window)          # [K]
         self.register_buffer("weights", weights * window)  # [K]
 
-        # pre-draw random projection matrix of shape [D, num_slices]
-        # we store them as a buffer so computations are deterministic (but cheap to replace)
-        rng = torch.Generator()
-        rng.manual_seed(seed)
-        A = torch.randn(feature_dim, num_slices, generator=rng)
-        # normalize columns (each slice is a unit vector)
-        A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-12)
-        self.register_buffer("A", A)   # [D, S]
+        # NOTE: We intentionally do NOT store a fixed projection matrix.
+        # We re-sample slices each forward pass (seeded by global_step) to better match SIGReg.
 
-    def forward(self, z):
+    def _sample_A(self, *, device: torch.device, dtype: torch.dtype, global_step: int | None):
+        rng = torch.Generator(device=device)
+        if global_step is None:
+            rng.manual_seed(self.seed)
+        else:
+            # Deterministic across DDP ranks if everyone uses the same global_step.
+            rng.manual_seed(int(self.seed) + int(global_step))
+
+        A = torch.randn(self.feature_dim, self.num_slices, generator=rng, device=device, dtype=dtype)
+        A = A / (A.norm(p=2, dim=0, keepdim=True) + 1e-12)
+        return A
+
+    def forward(self, z, global_step: int | None = None):
         """
         z: [B, T, D] OR [N, D]; we accept both
         returns scalar loss
@@ -60,7 +131,8 @@ class TemporalSIGReg(nn.Module):
             z_flat = z
         # z_flat: [N, D]
         # project: [N, S] = z_flat @ A
-        proj = z_flat @ self.A        # [N, S]
+        A = self._sample_A(device=z_flat.device, dtype=z_flat.dtype, global_step=global_step)
+        proj = z_flat @ A        # [N, S]
 
         # we want to evaluate characteristic function at several t values (knots)
         # expand proj to [N, S, K] by outer product with self.t
@@ -87,7 +159,14 @@ class LeJEPA_Forecaster(L.LightningModule):
     def __init__(self, encoder_backbone, input_dim, horizon,
                  proj_dim=128, num_slices=1024, lamb=0.5, lr=1e-3,
                  scaler_mean=None, scaler_std=None,
-                 use_covariates=False, num_time_features=6):
+                 use_covariates=False, num_time_features=6,
+                 reg_type="sigreg", vicreg_gamma=1.0, vicreg_mu=1.0):
+        """
+        Args:
+            reg_type: "sigreg" (default) or "vicreg" for regularization type
+            vicreg_gamma: VICReg variance target std (only used if reg_type="vicreg")
+            vicreg_mu: VICReg covariance loss weight (only used if reg_type="vicreg")
+        """
         super().__init__()
         self.save_hyperparameters(ignore=['encoder_backbone'])
         self.backbone = encoder_backbone                 # encoder should accept windows and return [B, T, D] or [B, D]
@@ -100,27 +179,14 @@ class LeJEPA_Forecaster(L.LightningModule):
         self.num_time_features = num_time_features
 
         # Projector: map backbone outputs to proj_dim
+        # We use a 2-layer MLP (Blue configuration) but switch to BatchNorm1d for better SSL statistics
+        # and remove Dropout.
         self.proj = nn.Sequential(
-            nn.BatchNorm1d(self.backbone_out),
             nn.Linear(self.backbone_out, proj_dim*2),
-            nn.Dropout(0.1),
+            nn.BatchNorm1d(proj_dim*2),
             nn.GELU(),
             nn.Linear(proj_dim*2, proj_dim),
         )
-
-        # Predictor: map context projected embeddings -> target projected embeddings
-        self.predictor = nn.Sequential(
-            nn.Linear(proj_dim, proj_dim//2),
-            nn.GELU(),
-            nn.Linear(proj_dim//2, proj_dim)
-        )
-
-        # SIGReg Setup
-        if have_lejepa:
-            from lejepa.univariate import EppsPulley
-            self.sigreg = SlicingUnivariateTest(univariate_test=EppsPulley(num_points=17), num_slices=num_slices)
-        else:
-            self.sigreg = TemporalSIGReg(feature_dim=proj_dim, num_slices=num_slices, A_dim=256)
 
         # Future covariate encoder (for known future time features)
         if use_covariates:
@@ -134,16 +200,25 @@ class LeJEPA_Forecaster(L.LightningModule):
             self.future_cov_encoder = None
             forecast_input_dim = self.backbone_out
 
+        # Predictor: map context projected embeddings -> target projected embeddings
+        self.predictor = nn.Sequential(
+            nn.Linear(proj_dim, proj_dim),  # maintained dim
+            nn.LayerNorm(proj_dim),         # added norm for stability
+            nn.GELU(),
+            nn.Linear(proj_dim, proj_dim)   # output delta
+        )
+
+        # Regularizer: SIGReg or VICReg
+        self.reg_type = reg_type
+        if reg_type == "vicreg":
+            self.regularizer = TemporalVICReg(feature_dim=proj_dim, gamma=vicreg_gamma, mu=vicreg_mu)
+        else:
+            self.regularizer = TemporalSIGReg(feature_dim=proj_dim, num_slices=num_slices, A_dim=256)
+
         # Forecasting head
         self.forecast_head = nn.Sequential(
-            nn.BatchNorm1d(forecast_input_dim),
-            nn.Dropout(0.25),
-            nn.Linear(forecast_input_dim, proj_dim*2),
-            nn.GELU(),
-            nn.Dropout(0.25),
-            nn.Linear(proj_dim*2, proj_dim),
-            nn.GELU(),
-            nn.Linear(proj_dim, input_dim*horizon)
+            nn.LayerNorm(forecast_input_dim),
+            nn.Linear(forecast_input_dim, input_dim*horizon)
         )
         self.horizon = horizon
         self.input_dim = input_dim
@@ -158,7 +233,9 @@ class LeJEPA_Forecaster(L.LightningModule):
         else:
             self.scaler_mean = None
             self.scaler_std = None
-        torch.set_float32_matmul_precision('high')
+        torch.set_float32_matmul_precision('high') # we lets it be here to later use with ray?
+
+        
     def forward(self, x, time_features=None):
         """Standard forward pass: encode a single window or multiple views."""
         # If x is [B, C, L], just encode it
@@ -170,15 +247,29 @@ class LeJEPA_Forecaster(L.LightningModule):
             if time_features is not None:
                 # Flatten time_features to [B*V, ...]
                 tf_flat = time_features.reshape(B * V, *time_features.shape[2:])
-                emb = self.backbone(x, tf_flat)
+                emb = self._backbone_forward(x, tf_flat)
             else:
-                emb = self.backbone(x)
-                
+                emb = self._backbone_forward(x)
+
+            # NOTE: This reshape assumes the backbone returns [B*V, D]. If the backbone returns
+            # per-time embeddings [B*V, T, D], this will silently flatten (T*D) and lose structure.
+            # If you ever use this path with a token-level backbone, revisit this return shape.
             return emb.view(B, V, -1)
             
-        if time_features is not None:
+        return self._backbone_forward(x, time_features)
+
+    def _backbone_forward(self, x, time_features=None):
+        """Call backbone with optional time_features.
+
+        Some backbones (e.g., simple CNN encoders) only accept the window tensor.
+        In that case we silently ignore time_features.
+        """
+        if time_features is None:
+            return self.backbone(x)
+        try:
             return self.backbone(x, time_features)
-        return self.backbone(x)
+        except TypeError:
+            return self.backbone(x)
 
     def encode_window(self, window, time_features=None):
         """
@@ -186,18 +277,23 @@ class LeJEPA_Forecaster(L.LightningModule):
         time_features: Optional temporal covariates
         returns: embeddings per token/time-step [B, T, D] OR pooled [B, D]
         """
-        if time_features is not None:
-            return self.backbone(window, time_features)
-        return self.backbone(window)
+        return self._backbone_forward(window, time_features)
 
     def shared_step(self, batch, batch_idx, mode="train"):
         """
         Expect dataset to return:
-          views: [B, V, C, L] (in our case V=3: t-1, t0, t+1)
+                    views: [B, V, C, L] with V >= 3
           y_true: [B, H, C] (actual future numeric targets, transposed)
           view_times: [B, V, L, 6] - time features for each view (optional)
           future_times: [B, H, 6] - time features for forecast horizon (optional)
         """
+        # Safety guard: cuDNN RNNs (LSTM/GRU) require training-mode forward
+        # if we will backprop through them. If something (e.g., a notebook cell,
+        # callback, or probe code) accidentally called `.eval()` on the backbone,
+        # training would crash with: "cudnn RNN backward can only be called in training mode".
+        if mode == "train" and hasattr(self, "backbone") and not self.backbone.training:
+            self.backbone.train(True)
+
         # Unpack batch - handle both old (2-tuple) and new (4-tuple) format
         if len(batch) == 4:
             views, y_true, view_times, future_times = batch
@@ -206,6 +302,11 @@ class LeJEPA_Forecaster(L.LightningModule):
             view_times, future_times = None, None
         
         B, V, C, L = views.shape
+        if V < 3:
+            raise ValueError(
+                f"Expected at least 3 views (prev, curr, next). Got V={V}. "
+                "Check dataset repeat_factor and view construction."
+            )
 
         # 1) Encode all views
         # views: [B, V, C, L] -> flatten batch and view dimensions for encoder
@@ -237,40 +338,59 @@ class LeJEPA_Forecaster(L.LightningModule):
             
         # Reshape back to [B, V, P]
         pooled_views = pooled_all.view(B, V, -1)
+        # View convention:
+        # - index 0: previous window (t-1)
+        # - indices 1..V-2: repeated augmented current window(s) (t0)
+        # - index V-1: next window (t+1)
         z_prev = pooled_views[:, 0, :]
-        z_curr = pooled_views[:, 1, :]
-        z_next = pooled_views[:, 2, :]
-
+        z_next = pooled_views[:, -1, :]
+        z_curr_repeats = pooled_views[:, 1:-1, :]  # [B, R, P]
+        z_curr = z_curr_repeats.mean(dim=1)        # [B, P]
         # 2) JEPA Loss: 
-        # a) Consistency loss: t-1, t0, t+1 should be similar in embedding space
-        # We can use MSE or SIGReg on these.
-        temp_inv_loss = (F.mse_loss(z_prev, z_curr) + F.mse_loss(z_next, z_curr)) * 0.5
+        # a) Consistency loss: ONLY on augmentations of the same window (t0)
+        # pooled_views shape [B, Views, P]. We need variance across the repeated views of t0.
         
-        # b) Predictive loss: predict "something" from t0. 
-        # In JEPA, we usually predict a target representation. 
-        # Since we don't have a "target" window in the input views (except y_true which is raw),
-        # we can either:
-        # 1. Predict z_curr from z_prev? 
-        # 2. Predict a future embedding if we had one.
-        # User goal: "get the model to embedd t-1,t0,t+1 at a similar position"
-        # So consistency loss is key.
+        curr_mean = z_curr_repeats.mean(dim=1, keepdim=True) # [B, 1, P]
+        temp_inv_loss = (z_curr_repeats - curr_mean).square().mean()
+       
         
-        pred_curr = self.predictor(z_prev)
-        pred_next = self.predictor(z_curr)
-        loss_pred = F.mse_loss(pred_curr, z_curr)
-        loss_pred += F.mse_loss(pred_next, z_next)
+        
+        # Prepare inputs for predictor (z only, no time injection)
+        # We strict to the 'orange' run logic which was stable. 
+        # Time conditioning polluted the representation learning when lambda was low.
+        
+        # b) Predictive loss: Predictor learns temporal transformation (Residual/Differential)
+        # We predict the DELTA: z_{t+1} = z_t + P(z_t)
+        delta_prev = self.predictor(z_prev)
+        delta_curr = self.predictor(z_curr)
+        
+        pred_curr = z_prev + delta_prev
+        pred_next = z_curr + delta_curr
+        
+        loss_pred = F.mse_loss(pred_curr, z_curr) + F.mse_loss(pred_next, z_next)
 
-        # 3) SIGReg regularization: apply to the *set* of embeddings
-        loss_sigreg = self.sigreg(z_all)
+        # 3) Regularization: SIGReg or VICReg
+        if self.reg_type == "vicreg":
+            reg_result = self.regularizer(z_all, global_step=self.global_step, return_components=True)
+            loss_sigreg = reg_result["total"]
+            # Log VICReg components for diagnostics
+            self.log(f"{mode}/vicreg_var_loss", reg_result["var_loss"])
+            self.log(f"{mode}/vicreg_cov_loss", reg_result["cov_loss"])
+            self.log(f"{mode}/vicreg_std_mean", reg_result["std_mean"])
+            self.log(f"{mode}/vicreg_std_min", reg_result["std_min"])
+        else:
+            loss_sigreg = self.regularizer(z_all, global_step=self.global_step)
 
         # 4) Supervised forecast: decode from t0 backbone
         # Get t0 backbone embeddings [B, D] or [B, T, D]
         if emb_all.dim() == 3:
-            emb_t0 = emb_all.view(B, V, -1, self.backbone_out)[:, 1, :, :]
-            pooled_t0 = emb_t0.mean(dim=1)
+            emb_views = emb_all.view(B, V, -1, self.backbone_out)
+            # Average over repeated t0 views, then pool over time.
+            emb_t0 = emb_views[:, 1:-1, :, :].mean(dim=1)  # [B, T, D]
+            pooled_t0 = emb_t0.mean(dim=1)                 # [B, D]
         else:
-            emb_t0 = emb_all.view(B, V, -1)[:, 1, :]
-            pooled_t0 = emb_t0
+            emb_views = emb_all.view(B, V, -1)
+            pooled_t0 = emb_views[:, 1:-1, :].mean(dim=1)  # [B, D]
 
         # Forecast with optional future covariate conditioning
         if self.use_covariates and future_times is not None:
@@ -278,8 +398,12 @@ class LeJEPA_Forecaster(L.LightningModule):
             forecast_input = torch.cat([pooled_t0.detach(), future_cov_emb], dim=-1)
         else:
             forecast_input = pooled_t0.detach()
-        
-        y_pred = self.forecast_head(forecast_input).view(-1, self.input_dim, self.horizon)
+
+        # NOTE: `detach()` makes the forecasting head a pure probe: forecast loss does not update
+        # the encoder. This is intentional as we want to evaluate the representation quality.
+
+        # NOTE: `-1` should equal B here. Using `view(B, ...)` is safer if shapes ever change.
+        y_pred = self.forecast_head(forecast_input).view(B,self.input_dim, self.horizon)
         
         # Ensure y_true is [B, C, L] for loss calculation
         if y_true.shape[1] == self.horizon and y_true.shape[2] == self.input_dim:
@@ -300,8 +424,8 @@ class LeJEPA_Forecaster(L.LightningModule):
 
         # Unscaled MAE for validation/test
         if mode in ["val", "test"] and self.scaler_mean is not None and self.scaler_std is not None:
-            # y_pred, y_true are [B, H, C]
-            # self.scaler_mean/std are [1, 1, C]
+            # NOTE: y_pred/y_true are [B, C, H] at this point.
+            # TorchStandardScaler stores mean/std as [1, C, 1]; broadcasting relies on that.
             y_pred_unscaled = y_pred * self.scaler_std + self.scaler_mean
             y_true_unscaled = y_true * self.scaler_std + self.scaler_mean
             mae_unscaled = F.l1_loss(y_pred_unscaled, y_true_unscaled)
@@ -330,17 +454,19 @@ class LeJEPA_Forecaster(L.LightningModule):
             {"params": ssl_params, "lr": self.lr, "weight_decay": 5e-2},
             {"params": forecast_params, "lr": 1e-3, "weight_decay": 1e-7}
         ])
+        
 
         # OneCycle usage: ensure trainer.estimated_stepping_batches is available
-        if hasattr(self.trainer, "estimated_stepping_batches") and self.trainer.estimated_stepping_batches is not None:
-            sched = torch.optim.lr_scheduler.OneCycleLR(
-                opt, 
-                max_lr=[self.lr, 5e-4], # match the max_lr for each group
-                total_steps=self.trainer.estimated_stepping_batches
-            )
-            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        # if hasattr(self.trainer, "estimated_stepping_batches") and self.trainer.estimated_stepping_batches is not None:
+        #     sched = torch.optim.lr_scheduler.OneCycleLR(...)
         
-        return opt
+        # We restore CosineAnnealingLR which was present in 'Blue' run equivalents (implied) or beneficial for convergence
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, 
+            T_max=self.trainer.max_epochs, 
+            eta_min=1e-5
+        )
+        return {"optimizer": opt, "lr_scheduler": scheduler}
 
     @property
     def scaler(self):

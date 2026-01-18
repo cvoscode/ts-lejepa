@@ -53,13 +53,14 @@ class TimeSeriesLSTMEncoder(nn.Module):
     Processes sensor data through stacked LSTM layers,
     then aggregates temporal information via pooling.
     """
-    def __init__(self, input_channels: int = 170, encoder_output_dim: int = 12, 
+    def __init__(self, input_channels: int = 170, output_dim: int = 12, 
                  proj_dim: int = 128, hidden_channels: int = 64, num_layers: int = 2,
                  dropout: float = 0.2, bidirectional: bool = True):
         super().__init__()
         
         self.input_channels = input_channels
-        self.encoder_output_dim = encoder_output_dim
+        # LeJEPA_Forecaster expects the backbone to expose .output_dim
+        self.output_dim = output_dim
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         self.bidirectional = bidirectional
@@ -81,12 +82,12 @@ class TimeSeriesLSTMEncoder(nn.Module):
         self.pooling = MultiScalePool(lstm_out_channels)
         
         # Encoder head: reduce to embedding dimension
-        self.encoder_head = nn.Linear(lstm_out_channels, encoder_output_dim)
+        self.encoder_head = nn.Linear(lstm_out_channels, output_dim)
         
         # Projector
         self.proj = JEPAProjector(
-            input_dim=encoder_output_dim, 
-            hidden_dim=4*encoder_output_dim,
+            input_dim=output_dim, 
+            hidden_dim=4*output_dim,
             output_dim=proj_dim,
           
         )
@@ -130,25 +131,35 @@ class TimeSeriesLSTMEncoder(nn.Module):
         
         return emb_out
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: [B, V, C, L] - batch of multiple views of time series
-            
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor | None = None, return_proj: bool = False):
+        """Encode a window.
+
+        LeJEPA_Forecaster passes `x` as [B*V, C, L]. Older code in this repo sometimes
+        uses [B, V, C, L]; both are supported.
+
         Returns:
-            emb: [B*V, encoder_output_dim]
-            proj: [B*V, proj_dim]
+            - by default: embeddings of shape [B*V, D] (or [B, V, D] if you pass [B, V, C, L])
+            - if return_proj=True: (emb, proj)
         """
-        N, V, C, L = x.shape
-        x_flat = x.view(N * V, C, L)
-        
-        # Forward through backbone
-        emb = self._backbone_forward(x_flat)
-        
-        # Project embeddings
-        proj = self.proj(emb)
-        
-        return emb, proj
+        _ = time_features  # accepted for API compatibility; not used in this backbone
+
+        if x.dim() == 4:
+            N, V, C, L = x.shape
+            x_flat = x.view(N * V, C, L)
+            emb = self._backbone_forward(x_flat)
+            if return_proj:
+                proj = self.proj(emb)
+                return emb, proj
+            return emb.view(N, V, -1)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
+
+        emb = self._backbone_forward(x)
+        if return_proj:
+            proj = self.proj(emb)
+            return emb, proj
+        return emb
 
 
 class TimeSeriesGRUEncoder(nn.Module):
@@ -166,6 +177,8 @@ class TimeSeriesGRUEncoder(nn.Module):
         
         self.input_channels = input_channels
         self.encoder_output_dim = encoder_output_dim
+        # LeJEPA_Forecaster expects the backbone to expose .output_dim
+        self.output_dim = encoder_output_dim
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         self.bidirectional = bidirectional
@@ -236,25 +249,27 @@ class TimeSeriesGRUEncoder(nn.Module):
         
         return emb_out
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: [B, V, C, L] - batch of multiple views of time series
-            
-        Returns:
-            emb: [B*V, encoder_output_dim]
-            proj: [B*V, proj_dim]
-        """
-        N, V, C, L = x.shape
-        x_flat = x.view(N * V, C, L)
-        
-        # Forward through backbone
-        emb = self._backbone_forward(x_flat)
-        
-        # Project embeddings
-        proj = self.proj(emb)
-        
-        return emb, proj
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor | None = None, return_proj: bool = False):
+        """Encode a window; supports x as [B*V, C, L] or [B, V, C, L]."""
+        _ = time_features  # accepted for API compatibility; not used
+
+        if x.dim() == 4:
+            N, V, C, L = x.shape
+            x_flat = x.view(N * V, C, L)
+            emb = self._backbone_forward(x_flat)
+            if return_proj:
+                proj = self.proj(emb)
+                return emb, proj
+            return emb.view(N, V, -1)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
+
+        emb = self._backbone_forward(x)
+        if return_proj:
+            proj = self.proj(emb)
+            return emb, proj
+        return emb
 
 
 class TimeSeriesAttentionRNNEncoder(nn.Module):
@@ -271,6 +286,8 @@ class TimeSeriesAttentionRNNEncoder(nn.Module):
         # never use instance norm!
         self.input_channels = input_channels
         self.encoder_output_dim = encoder_output_dim
+        # LeJEPA_Forecaster expects the backbone to expose .output_dim
+        self.output_dim = encoder_output_dim
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         self.bidirectional = bidirectional
@@ -347,22 +364,24 @@ class TimeSeriesAttentionRNNEncoder(nn.Module):
         
         return emb_out
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: [B, V, C, L] - batch of multiple views of time series
-            
-        Returns:
-            emb: [B*V, encoder_output_dim]
-            proj: [B*V, proj_dim]
-        """
-        N, V, C, L = x.shape
-        x_flat = x.view(N * V, C, L)
-        
-        # Forward through backbone
-        emb = self._backbone_forward(x_flat)
-        
-        # Project embeddings
-        proj = self.proj(emb)
-        
-        return emb, proj
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor | None = None, return_proj: bool = False):
+        """Encode a window; supports x as [B*V, C, L] or [B, V, C, L]."""
+        _ = time_features  # accepted for API compatibility; not used
+
+        if x.dim() == 4:
+            N, V, C, L = x.shape
+            x_flat = x.view(N * V, C, L)
+            emb = self._backbone_forward(x_flat)
+            if return_proj:
+                proj = self.proj(emb)
+                return emb, proj
+            return emb.view(N, V, -1)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
+
+        emb = self._backbone_forward(x)
+        if return_proj:
+            proj = self.proj(emb)
+            return emb, proj
+        return emb

@@ -25,10 +25,10 @@ class CovariateEncoder(nn.Module):
         self.net = nn.Sequential(
             # [B, 6, L] -> [B, hidden_dim, L]
             nn.Conv1d(input_features, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.AdaptiveAvgPool1d(1),  # [B, hidden_dim, 1]
             nn.Flatten(),             # [B, hidden_dim]
@@ -107,7 +107,7 @@ class FutureCovariateEncoder(nn.Module):
         
         self.net = nn.Sequential(
             nn.Conv1d(input_features, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),

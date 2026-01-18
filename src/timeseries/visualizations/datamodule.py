@@ -2,6 +2,11 @@ import numpy as np
 from matplotlib import pyplot as plt
 import plotly.graph_objects as go
 import plotly.io as pio
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..data.pems import PeMS08DataModule
+
 pio.templates.default = "plotly_white"
 def visualize_pems_tuple(
     datamodule: 'PeMS08DataModule',
@@ -10,7 +15,13 @@ def visualize_pems_tuple(
     sensor_index: int = 0,
 ):
     """
-    Visualisiert die drei Eingabefenster (t-1, t0, t+1) und das Target-Fenster.
+    Visualisiert die Eingabefenster (t-1, t0, t+1) und das Target-Fenster.
+
+    Notes:
+    - The dataset can return a variable number of views V.
+      Convention is: view[0]=t-1, view[1:V-1]=repeated augmented t0 views, view[V-1]=t+1.
+      Therefore repeat_factor = V - 2.
+    - sensor_index is treated as 1-based if > 0 (historical behavior), else 0-based.
     """
     dataloader = datamodule.train_dataloader() if stage == 'train' else datamodule.val_dataloader()
     # 2. Den ersten Batch abrufen
@@ -29,14 +40,33 @@ def visualize_pems_tuple(
     if batch_index >= views_batch.size(0):
         print(f"Fehler: Batch-Index {batch_index} ist außerhalb des Bereichs (Batch-Größe: {views_batch.size(0)})")
         return
+
+    if views_batch.ndim != 4:
+        print(f"Fehler: Erwartete views_batch mit 4 Dimensionen [B, V, C, L], got shape={tuple(views_batch.shape)}")
+        return
     
     # Extrahiere Parameter
     L_in = datamodule.cfg.window_size
     L_target = datamodule.cfg.target_window_size
     temporal_shift = getattr(datamodule.cfg, "temporal_shift",0)
 
+    V = int(views_batch.shape[1])
+    if V < 3:
+        print(f"Fehler: Erwartete mindestens 3 Views (t-1, t0, t+1), got V={V}")
+        return
+    repeat_factor = V - 2
+
+    sensor_idx = sensor_index - 1 if sensor_index > 0 else 0
+    if sensor_idx < 0 or sensor_idx >= int(views_batch.shape[2]):
+        print(
+            f"Fehler: sensor_index={sensor_index} (interpreted idx={sensor_idx}) ist außerhalb des Bereichs "
+            f"[0, {int(views_batch.shape[2]) - 1}]"
+        )
+        return
+
     print(f"--- Visualisierung ({stage}-Daten) ---")
     print(f"Fensterlängen: L_in={L_in}, Target={L_target}. | Temporal Shift: {temporal_shift}")
+    print(f"Views: V={V} => repeat_factor={repeat_factor} (t0 repeated views)")
     
     # 3. Visualisierung
     fig = go.Figure()
@@ -51,13 +81,39 @@ def visualize_pems_tuple(
     time_target = np.arange(L_in, L_in + L_target)
 
     # target_batch shape: [B, L_target, C] (transposed in dataset)
-    v_prev = views_batch[batch_index, 0, sensor_index-1, :].cpu().numpy()
-    v_curr = views_batch[batch_index, 1, sensor_index-1, :].cpu().numpy()
-    v_next = views_batch[batch_index, 2, sensor_index-1, :].cpu().numpy()
-    target = target_batch[batch_index, :, sensor_index-1].cpu().numpy()
+    v_prev = views_batch[batch_index, 0, sensor_idx, :].cpu().numpy()
+    v_next = views_batch[batch_index, -1, sensor_idx, :].cpu().numpy()
+    target = target_batch[batch_index, :, sensor_idx].cpu().numpy()
 
     fig.add_trace(go.Scatter(x=time_prev, y=v_prev, name='T-1 (Shifted Back)', line=dict(color='blue', width=2, dash='dash'), opacity=0.5))
-    fig.add_trace(go.Scatter(x=time_curr, y=v_curr, name='T0 (Reference)', line=dict(color='green', width=2), opacity=0.8))
+
+    # Plot each repeated augmented t0 view, plus their mean.
+    curr_views = []
+    for j in range(1, V - 1):
+        v_curr_j = views_batch[batch_index, j, sensor_idx, :].cpu().numpy()
+        curr_views.append(v_curr_j)
+        fig.add_trace(
+            go.Scatter(
+                x=time_curr,
+                y=v_curr_j,
+                name=f'T0 aug {j}/{repeat_factor}',
+                line=dict(color='rgba(0, 128, 0, 0.35)', width=1),
+                opacity=0.8,
+            )
+        )
+
+    if len(curr_views) > 0:
+        v_curr_mean = np.mean(np.stack(curr_views, axis=0), axis=0)
+        fig.add_trace(
+            go.Scatter(
+                x=time_curr,
+                y=v_curr_mean,
+                name='T0 mean (over repeats)',
+                line=dict(color='green', width=3),
+                opacity=0.9,
+            )
+        )
+
     fig.add_trace(go.Scatter(x=time_next, y=v_next, name='T+1 (Shifted Forward)', line=dict(color='red', width=2, dash='dash'), opacity=0.5))
     
     fig.add_trace(go.Scatter(x=time_target, y=target, name='Target (Future of T0)', line=dict(color='black', width=2, dash='dash'), opacity=0.5))
@@ -67,7 +123,7 @@ def visualize_pems_tuple(
     fig.add_vline(x=L_in, line_color='red', line_width=2, line_dash='dash', opacity=0.5, annotation_text='Ende T0 / Start Target')
 
     # 5. Titel und Achsenbeschriftungen
-    fig.update_layout(title=f'PeMS-Zeitreihe: Multi-Timestamp Views (Sensor {sensor_index}, Stage: {stage.upper()})',
+    fig.update_layout(title=f'PeMS-Zeitreihe: Multi-Timestamp Views (Sensor {sensor_idx}, V={V}, repeat_factor={repeat_factor}, Stage: {stage.upper()})',
                       xaxis_title='Relativer Zeitschritt (t0 Start = 0)',
                       yaxis_title='Skalierter Verkehrsfluss')
     

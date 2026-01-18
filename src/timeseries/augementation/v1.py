@@ -37,7 +37,8 @@ class TemporalBlockMasking(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, L)
-        if self.training and random.random() >= self.p:
+        # Apply with probability p during train, never during eval.
+        if (not self.training) or (random.random() >= self.p):
             return x
 
         B, C, L = x.shape
@@ -74,6 +75,7 @@ class TimeSeriesTransform(nn.Module):
     def __init__(
         self, output_length: int, 
         scale_range=(0.8, 1.2),
+        crop_ratio_range=None,
         jitter_std=0.05, 
         p_noise=0.3, 
         p_freq_mask=0.3, 
@@ -87,6 +89,9 @@ class TimeSeriesTransform(nn.Module):
         super().__init__()
         self.output_length = output_length
         self.scale_range = scale_range
+        # Crop ratio is now independent from amplitude scaling.
+        # Backward compatible default: if not specified, reuse scale_range.
+        self.crop_ratio_range = crop_ratio_range if crop_ratio_range is not None else scale_range
         self.jitter_std = jitter_std
         self.p_noise = p_noise
         self.p_freq_mask = p_freq_mask
@@ -132,7 +137,15 @@ class TimeSeriesTransform(nn.Module):
         rfft_data = torch.fft.rfft(x, dim=-1)
         rlen = rfft_data.size(-1)
         
+        # Guard against edge cases that would make randint bounds invalid.
+        if rlen <= 2:
+            return x
+
         max_mask = max(1, int(rlen * self.max_freq_ratio))
+        # Ensure at least one valid start index in [1, rlen-max_mask).
+        if max_mask >= (rlen - 1):
+            return x
+
         mask_starts = torch.randint(1, rlen - max_mask, (B, C), device=x.device)
         mask_sizes = torch.randint(1, max_mask + 1, (B, C), device=x.device)
         
@@ -172,7 +185,7 @@ class TimeSeriesTransform(nn.Module):
         # Random crop for the whole batch for performance, or different per sample
         # Let's do different per sample but vectorized using grid_sample or just interpolate
         # Simple version: Fixed size crop from random start
-        crop_ratio = random.uniform(*self.scale_range) 
+        crop_ratio = random.uniform(*self.crop_ratio_range)
         crop_L = int(L_in * crop_ratio)
         crop_L = max(1, min(crop_L, L_in))
         

@@ -12,19 +12,19 @@ class ResidualBlock1d(nn.Module):
         padding = (kernel_size - 1) // 2
         
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False)
-        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.bn1 = nn.LayerNorm(out_channels)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, stride=1, padding=padding, bias=False)
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.bn2 = nn.LayerNorm(out_channels)
         
         # Shortcut anpassen, falls sich Dimensionen ändern (z.B. durch Stride oder Kanaländerung)
         self.downsample = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.downsample = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
+                nn.LayerNorm(out_channels)
             )
 
     def forward(self, x):
@@ -95,12 +95,14 @@ class TimeSeriesEncoder(nn.Module):
     def __init__(self, input_channels: int = 170, encoder_output_dim: int = 12, 
                  proj_dim: int = 128):
         super().__init__()
+        # LeJEPA_Forecaster expects the backbone to expose .output_dim
+        self.output_dim = encoder_output_dim
         
       
         
         self.stem = nn.Sequential(
             nn.Conv1d(input_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(64),
+            nn.LayerNorm(64),
             nn.ReLU()
         )
         self.layer1 = ResidualBlock1d(64, 128, stride=2)
@@ -136,13 +138,24 @@ class TimeSeriesEncoder(nn.Module):
         emb = self.encoder_head(x)
         return emb
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        N, V, C, L = x.shape
-        x_flat = x.view(N * V, C, L)
-        
-        emb = self._backbone_forward(x_flat)
-        
-        # Projektor liefert jetzt bereits normalisierte Werte
-        proj = self.proj(emb) 
-        
-        return emb, proj
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor | None = None, return_proj: bool = False):
+        """Encode a window; supports x as [B*V, C, L] or [B, V, C, L]."""
+        _ = time_features  # accepted for API compatibility; not used
+
+        if x.dim() == 4:
+            N, V, C, L = x.shape
+            x_flat = x.view(N * V, C, L)
+            emb = self._backbone_forward(x_flat)
+            if return_proj:
+                proj = self.proj(emb)
+                return emb, proj
+            return emb.view(N, V, -1)
+
+        if x.dim() != 3:
+            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
+
+        emb = self._backbone_forward(x)
+        if return_proj:
+            proj = self.proj(emb)
+            return emb, proj
+        return emb

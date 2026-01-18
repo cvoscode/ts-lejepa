@@ -359,15 +359,9 @@ class LeJEPA_Forecaster(L.LightningModule):
         # We strict to the 'orange' run logic which was stable. 
         # Time conditioning polluted the representation learning when lambda was low.
         
-        # b) Predictive loss: Predictor learns temporal transformation (Residual/Differential)
-        # We predict the DELTA: z_{t+1} = z_t + P(z_t)
-        delta_prev = self.predictor(z_prev)
-        delta_curr = self.predictor(z_curr)
-        
-        pred_curr = z_prev + delta_prev
-        pred_next = z_curr + delta_curr
-        
-        loss_pred = F.mse_loss(pred_curr, z_curr) + F.mse_loss(pred_next, z_next)
+        # b) Predictive loss removed as per user request.
+        # We rely on Invariance (t0 augmentations) and SIGReg to shape the space.
+        loss_pred = torch.tensor(0.0, device=self.device)
 
         # 3) Regularization: SIGReg or VICReg
         if self.reg_type == "vicreg":

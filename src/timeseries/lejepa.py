@@ -299,10 +299,10 @@ class LeJEPA_Forecaster(L.LightningModule):
             reg_result = self.regularizer(z_all, global_step=self.global_step, return_components=True)
             loss_sigreg = reg_result["total"]
             # Log VICReg components for diagnostics
-            self.log(f"{mode}/vicreg_var_loss", reg_result["var_loss"])
-            self.log(f"{mode}/vicreg_cov_loss", reg_result["cov_loss"])
-            self.log(f"{mode}/vicreg_std_mean", reg_result["std_mean"])
-            self.log(f"{mode}/vicreg_std_min", reg_result["std_min"])
+            self.log(f"{mode}/vicreg_var_loss", reg_result["var_loss"], batch_size=B)
+            self.log(f"{mode}/vicreg_cov_loss", reg_result["cov_loss"], batch_size=B)
+            self.log(f"{mode}/vicreg_std_mean", reg_result["std_mean"], batch_size=B)
+            self.log(f"{mode}/vicreg_std_min", reg_result["std_min"], batch_size=B)
         else:
             loss_sigreg = self.regularizer(z_all, global_step=self.global_step)
 
@@ -340,12 +340,12 @@ class LeJEPA_Forecaster(L.LightningModule):
         total_loss = loss_forecast*0.1 + loss_ssl
 
         # logs
-        self.log(f"{mode}/total_loss", total_loss, prog_bar=True)
-        self.log(f"{mode}/mse_forecast", loss_forecast)
-        self.log(f"{mode}/loss_ssl", loss_ssl)
-        self.log(f"{mode}/pred_loss", loss_pred)
-        self.log(f"{mode}/temp_inv_loss", temp_inv_loss)
-        self.log(f"{mode}/sigreg", loss_sigreg)
+        self.log(f"{mode}/total_loss", total_loss, prog_bar=True, batch_size=B)
+        self.log(f"{mode}/mse_forecast", loss_forecast, batch_size=B)
+        self.log(f"{mode}/loss_ssl", loss_ssl, batch_size=B)
+        self.log(f"{mode}/pred_loss", loss_pred, batch_size=B)
+        self.log(f"{mode}/temp_inv_loss", temp_inv_loss, batch_size=B)
+        self.log(f"{mode}/sigreg", loss_sigreg, batch_size=B)
 
         # Unscaled MAE for validation/test
         if mode in ["val", "test"] and self.scaler_mean is not None and self.scaler_std is not None:
@@ -354,7 +354,7 @@ class LeJEPA_Forecaster(L.LightningModule):
             y_pred_unscaled = y_pred * self.scaler_std + self.scaler_mean
             y_true_unscaled = y_true * self.scaler_std + self.scaler_mean
             mae_unscaled = F.l1_loss(y_pred_unscaled, y_true_unscaled)
-            self.log(f"{mode}/mae_unscaled", mae_unscaled, prog_bar=True)
+            self.log(f"{mode}/mae_unscaled", mae_unscaled, prog_bar=True, batch_size=B)
 
         return total_loss
 

@@ -12,6 +12,10 @@ import lightning as L
 from typing import Optional, List
 from omegaconf import DictConfig
 from ..augementation.v1 import TimeSeriesTransform
+from .probe_dataset import ForecastProbeDataset
+from .view_builders import AugmentationViewBuilder
+from .view_dataset import ViewDataset, collate_batches
+from .window_dataset import WindowDataset
 from ..preprocessing.scalers import TorchStandardScaler
 from ..preprocessing.time_encoding import encode_timestamps_torch, NUM_TIME_FEATURES
 from dataclasses import dataclass
@@ -716,6 +720,230 @@ class PeMS08MultiScaleDataModule(L.LightningDataModule):
             temporal_shift=temporal_shift,
             stride=stride,
             num_local_views=num_local_views_val,
+        )
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=getattr(self.cfg, "num_workers", 0),
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=getattr(self.cfg, "num_workers", 0),
+        )
+
+
+class PeMS08SSLDataModule(L.LightningDataModule):
+    """PeMS08 SSL DataModule using past-only windows and view builders.
+
+    This module constructs t0 views plus optional t-1 view (no t+1).
+    """
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.save_hyperparameters()
+
+        self.scaler = TorchStandardScaler()
+
+        self.transform = TimeSeriesTransform(
+            output_length=self.cfg.window_size,
+            scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)),
+            jitter_std=getattr(self.cfg, "jitter_std", 0.1),
+            p_noise=getattr(self.cfg, "p_noise", 0.3),
+            p_freq_mask=getattr(self.cfg, "p_freq_mask", 0.0),
+            max_freq_ratio=getattr(self.cfg, "max_freq_ratio", 0.0),
+            p_temporal_mask=getattr(self.cfg, "p_temporal_mask", 0.8),
+            p_transform=getattr(self.cfg, "p_transform", 0.7),
+        )
+
+    def prepare_data(self):
+        PeMS08(root="./data/pems08", mask_zeros=True)
+
+    def _make_view_dataset(self, data: torch.Tensor, time_features: torch.Tensor, *, repeat_factor: int) -> ViewDataset:
+        include_prev = bool(getattr(self.cfg, "include_prev", True))
+        prev_shift = int(getattr(self.cfg, "prev_shift", getattr(self.cfg, "temporal_shift", 10)))
+        horizon = int(getattr(self.cfg, "target_window_size", 0))
+
+        window_ds = WindowDataset(
+            data,
+            time_features,
+            window_size=int(self.cfg.window_size),
+            stride=int(getattr(self.cfg, "stride", 1)),
+            include_prev=include_prev,
+            prev_shift=prev_shift,
+            horizon=horizon,
+        )
+
+        view_builder = AugmentationViewBuilder(
+            transform=self.transform,
+            repeat_factor=int(repeat_factor),
+            include_prev=include_prev,
+        )
+
+        return ViewDataset(window_ds, view_builder)
+
+    def setup(self, stage=None):
+        pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
+        data = torch.tensor(pems08.target.values, dtype=torch.float32)  # [T, C]
+
+        time_features = encode_timestamps_torch(pems08.timestamps)  # [T, 6]
+
+        split_mode = getattr(self.cfg, "split_mode", None)
+        if split_mode is None:
+            split_mode = "random_windows" if bool(getattr(self.cfg, "random_split", False)) else "temporal"
+
+        split_seed = int(getattr(self.cfg, "split_seed", 0))
+        split_frac = float(getattr(self.cfg, "train_split", 0.8))
+
+        if split_mode not in {"temporal", "random_windows", "ts_cv"}:
+            raise ValueError(f"Unknown cfg.split_mode={split_mode!r}. Use 'temporal', 'random_windows', or 'ts_cv'.")
+
+        if split_mode in {"temporal", "random_windows"} and not (0.0 < split_frac < 1.0):
+            raise ValueError(f"cfg.train_split must be in (0, 1), got {split_frac}")
+
+        repeat_factor_train = int(getattr(self.cfg, "repeat_factor", 2))
+        repeat_factor_val = int(getattr(self.cfg, "repeat_factor_val", repeat_factor_train))
+
+        if split_mode == "random_windows":
+            full_scaled_3d = self.scaler.fit_transform(data)
+            full_scaled_ct = full_scaled_3d.squeeze(0)  # [C, T]
+
+            base_train = self._make_view_dataset(full_scaled_ct, time_features, repeat_factor=repeat_factor_train)
+            base_val = self._make_view_dataset(full_scaled_ct, time_features, repeat_factor=repeat_factor_val)
+
+            n_windows = len(base_train)
+            n_train = int(n_windows * split_frac)
+            g = torch.Generator().manual_seed(split_seed)
+            perm = torch.randperm(n_windows, generator=g).tolist()
+            train_idx = perm[:n_train]
+            val_idx = perm[n_train:]
+            self.train_ds = Subset(base_train, train_idx)
+            self.val_ds = Subset(base_val, val_idx)
+            return
+
+        if split_mode == "ts_cv":
+            n_splits = int(getattr(self.cfg, "cv_folds", 5))
+            fold = int(getattr(self.cfg, "cv_fold", 0))
+            gap = int(getattr(self.cfg, "cv_gap", 0))
+
+            if n_splits < 2:
+                raise ValueError(f"cfg.cv_folds must be >= 2, got {n_splits}")
+            if not (0 <= fold < n_splits):
+                raise ValueError(f"cfg.cv_fold must be in [0, {n_splits - 1}], got {fold}")
+            if gap < 0:
+                raise ValueError(f"cfg.cv_gap must be >= 0, got {gap}")
+
+            T = len(data)
+            test_size = int(getattr(self.cfg, "cv_test_size", 0))
+            if test_size <= 0:
+                test_size = T // (n_splits + 1)
+
+            train_end = (fold + 1) * test_size
+            val_start = train_end + gap
+            val_end = min(val_start + test_size, T)
+
+            train_raw = data[:train_end]
+            val_raw = data[val_start:val_end]
+            train_time = time_features[:train_end]
+            val_time = time_features[val_start:val_end]
+
+            train_scaled_3d = self.scaler.fit_transform(train_raw)
+            val_scaled_3d = self.scaler.transform(val_raw)
+            train_scaled_ct = train_scaled_3d.squeeze(0)
+            val_scaled_ct = val_scaled_3d.squeeze(0)
+
+            self.train_ds = self._make_view_dataset(train_scaled_ct, train_time, repeat_factor=repeat_factor_train)
+            self.val_ds = self._make_view_dataset(val_scaled_ct, val_time, repeat_factor=repeat_factor_val)
+            return
+
+        # Temporal split (default)
+        n_train = int(len(data) * split_frac)
+        train_raw = data[:n_train]
+        val_raw = data[n_train:]
+        train_time = time_features[:n_train]
+        val_time = time_features[n_train:]
+
+        train_scaled_3d = self.scaler.fit_transform(train_raw)
+        val_scaled_3d = self.scaler.transform(val_raw)
+        train_scaled_ct = train_scaled_3d.squeeze(0)
+        val_scaled_ct = val_scaled_3d.squeeze(0)
+
+        self.train_ds = self._make_view_dataset(train_scaled_ct, train_time, repeat_factor=repeat_factor_train)
+        self.val_ds = self._make_view_dataset(val_scaled_ct, val_time, repeat_factor=repeat_factor_val)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=getattr(self.cfg, "num_workers", 0),
+            collate_fn=collate_batches,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,# needs to be for sigreg
+            num_workers=getattr(self.cfg, "num_workers", 0),
+            collate_fn=collate_batches,
+        )
+
+
+class PeMS08ProbeDataModule(L.LightningDataModule):
+    """PeMS08 DataModule for forecasting probe evaluation."""
+
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.save_hyperparameters()
+        self.scaler = TorchStandardScaler()
+
+    def prepare_data(self):
+        PeMS08(root="./data/pems08", mask_zeros=True)
+
+    def setup(self, stage=None):
+        pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
+        data = torch.tensor(pems08.target.values, dtype=torch.float32)  # [T, C]
+        time_features = encode_timestamps_torch(pems08.timestamps)  # [T, 6]
+
+        split_frac = float(getattr(self.cfg, "train_split", 0.8))
+        n_train = int(len(data) * split_frac)
+
+        train_raw = data[:n_train]
+        val_raw = data[n_train:]
+        train_time = time_features[:n_train]
+        val_time = time_features[n_train:]
+
+        train_scaled_3d = self.scaler.fit_transform(train_raw)
+        val_scaled_3d = self.scaler.transform(val_raw)
+        train_scaled_ct = train_scaled_3d.squeeze(0)
+        val_scaled_ct = val_scaled_3d.squeeze(0)
+
+        window_size = int(self.cfg.window_size)
+        horizon = int(self.cfg.target_window_size)
+        stride = int(getattr(self.cfg, "stride", 1))
+
+        self.train_ds = ForecastProbeDataset(
+            train_scaled_ct,
+            train_time,
+            window_size=window_size,
+            horizon=horizon,
+            stride=stride,
+        )
+        self.val_ds = ForecastProbeDataset(
+            val_scaled_ct,
+            val_time,
+            window_size=window_size,
+            horizon=horizon,
+            stride=stride,
         )
 
     def train_dataloader(self):

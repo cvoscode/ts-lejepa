@@ -170,7 +170,7 @@ def _ssl_trainable(config: Dict[str, Any], *, base_cfg: DictConfig) -> None:
             p_tminus1=float(cfg.get("p_tminus1", 0.1)),
             sample_policy=str(cfg.get("sample_policy", "at_least_one_tminus1")),
         ),
-        has_prev_view=bool(cfg.get("include_prev", True)),
+        num_prev_views=int(cfg.get("include_prev", 1)),  # Updated to support int
         sigreg_slices=int(cfg.get("sigreg_slices", 1024)),
         sigreg_knots=int(cfg.get("sigreg_knots", 17)),
         sigreg_seed=int(cfg.get("sigreg_seed", 0)),

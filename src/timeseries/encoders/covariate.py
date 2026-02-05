@@ -7,6 +7,10 @@ FusedEncoder: Combines sensor backbone + covariate encoder outputs
 
 import torch
 import torch.nn as nn
+import torch.nn.init as init
+
+from ..core.base_encoder import BaseEncoder
+from .layers import ChannelMixer
 
 
 class CovariateEncoder(nn.Module):
@@ -17,9 +21,28 @@ class CovariateEncoder(nn.Module):
     Output: [B, output_dim] - pooled temporal embedding
     """
     
-    def __init__(self, input_features: int = 6, hidden_dim: int = 64, output_dim: int = 64):
+    def __init__(
+        self,
+        input_features: int = 6,
+        hidden_dim: int = 64,
+        output_dim: int = 64,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
+    ):
         super().__init__()
         self.output_dim = output_dim
+
+        self.channel_mixer = ChannelMixer(
+            input_features,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
         
         # Process time features with 1D convolutions over time
         self.net = nn.Sequential(
@@ -44,82 +67,146 @@ class CovariateEncoder(nn.Module):
         """
         # Transpose to [B, num_features, L] for Conv1d
         x = x.transpose(1, 2)
+        x = self.channel_mixer(x)
         return self.net(x)
     
 
-class FusedEncoder(nn.Module):
+class FusedEncoder(BaseEncoder):
     """
     Fuses sensor encoder output with covariate encoder output.
     
-    Concatenates both embeddings and projects to a unified dimension.
+    Both encoders should be BaseEncoder instances.
+    Concatenates embeddings at each timestep and projects to unified dimension.
     """
     
-    def __init__(self, sensor_encoder: nn.Module, covariate_encoder: nn.Module, 
-                 fusion_dim: int = None):
-        super().__init__()
+    def __init__(self, sensor_encoder: BaseEncoder, covariate_encoder: BaseEncoder, 
+                 output_dim: int = None, pool_mode: str = "mean"):
+        # Use sensor encoder's input channels as our input channels
+        input_channels = sensor_encoder.input_channels
+        
+        # Default output_dim to sensor encoder's output_dim
+        if output_dim is None:
+            output_dim = sensor_encoder.output_dim
+        
+        super().__init__(input_channels, output_dim, pool_mode)
+        
+        # Set both encoders to 'none' pooling so we get temporal outputs
         self.sensor_encoder = sensor_encoder
+        self.sensor_encoder.pool_mode = "none"
+        
         self.covariate_encoder = covariate_encoder
-        
-        sensor_out = getattr(sensor_encoder, "output_dim", None)
-        cov_out = getattr(covariate_encoder, "output_dim", None)
-        
-        if sensor_out is None or cov_out is None:
-            raise ValueError("Both encoders must expose .output_dim attribute")
-        
-        self.sensor_out = sensor_out
-        self.cov_out = cov_out
-        
-        # Output dimension defaults to sensor encoder's output
-        self.output_dim = fusion_dim if fusion_dim is not None else sensor_out
+        self.covariate_encoder.pool_mode = "none"
         
         # Fusion projection
+        fusion_input_dim = sensor_encoder.output_dim + covariate_encoder.output_dim
         self.fusion = nn.Sequential(
-            nn.Linear(sensor_out + cov_out, self.output_dim),
+            nn.Linear(fusion_input_dim, output_dim),
+            nn.LayerNorm(output_dim),
             nn.GELU(),
         )
+        
+        self.apply(self._init_weights)
     
-    def forward(self, sensor_data: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            init.orthogonal_(m.weight)
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            init.constant_(m.weight, 1)
+            init.constant_(m.bias, 0)
+    
+    def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            sensor_data: Sensor input [B, C, L]
-            time_features: Time covariates [B, L, 6]
+            x: Sensor input [B, C, L]
+            time_features: Time covariates [B, L, F]
         Returns:
-            Fused embedding [B, output_dim]
+            Fused embedding [B, L, D]
         """
-        sensor_emb = self.sensor_encoder(sensor_data)   # [B, sensor_out]
-        cov_emb = self.covariate_encoder(time_features) # [B, cov_out]
+        if time_features is None:
+            raise ValueError("FusedEncoder requires time_features")
         
-        fused = torch.cat([sensor_emb, cov_emb], dim=-1)  # [B, sensor_out + cov_out]
-        return self.fusion(fused)  # [B, output_dim]
+        # Both return [B, L, D_sensor] and [B, L, D_cov]
+        sensor_emb = self.sensor_encoder.forward_backbone(x, time_features)
+        cov_emb = self.covariate_encoder.forward_backbone(x, time_features)
+        
+        # Concatenate along feature dimension
+        fused = torch.cat([sensor_emb, cov_emb], dim=-1)  # [B, L, D_sensor + D_cov]
+        return self.fusion(fused)  # [B, L, D]
 
 
-class FutureCovariateEncoder(nn.Module):
+class FutureCovariateEncoder(BaseEncoder):
     """
     Encodes known future covariates for the forecast horizon.
     
-    Input: [B, H, 6] - time features for each forecast step
-    Output: [B, output_dim] - aggregated future context
+    Input: time_features [B, H, F] - time features for each forecast step
+    Output: [B, H, D] or pooled [B, D] depending on pool_mode
     """
     
-    def __init__(self, input_features: int = 6, hidden_dim: int = 32, output_dim: int = 64):
-        super().__init__()
-        self.output_dim = output_dim
+    def __init__(
+        self,
+        input_channels: int = 6,
+        output_dim: int = 64,
+        pool_mode: str = "mean",
+        hidden_dim: int = 32,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
+    ):
+        super().__init__(input_channels, output_dim, pool_mode)
+        self.hidden_dim = hidden_dim
+
+        self.channel_mixer = ChannelMixer(
+            input_channels,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
         
         self.net = nn.Sequential(
-            nn.Conv1d(input_features, hidden_dim, kernel_size=3, padding=1),
+            nn.Conv1d(input_channels, hidden_dim, kernel_size=3, padding=1),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(hidden_dim, output_dim),
         )
+        
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+        
+        self.apply(self._init_weights)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            init.orthogonal_(m.weight)
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.LayerNorm):
+            init.constant_(m.weight, 1)
+            init.constant_(m.bias, 0)
+    
+    def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
-            x: Future time features [B, H, num_features]
+            x: Ignored (can be dummy input)
+            time_features: Future time features [B, H, F]
         Returns:
-            Future context embedding [B, output_dim]
+            Future context embedding [B, H, D]
         """
-        x = x.transpose(1, 2)  # [B, num_features, H]
-        return self.net(x)
+        if time_features is None:
+            raise ValueError("FutureCovariateEncoder requires time_features")
+        
+        # time_features: [B, H, F] -> [B, F, H]
+        x = time_features.transpose(1, 2)
+        x = self.channel_mixer(x)
+        x = self.net(x)  # [B, hidden_dim, H]
+        x = x.transpose(1, 2)  # [B, H, hidden_dim]
+        x = self.proj(x)  # [B, H, D]
+        return x

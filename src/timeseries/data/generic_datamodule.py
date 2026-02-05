@@ -107,10 +107,16 @@ class GenericTimeSeriesDataModule(L.LightningDataModule):
             FeatureJitter(jitter_std=0.01)
         ])
         
+        include_prev_raw = self.cfg.get("include_prev", True)
+        if isinstance(include_prev_raw, bool):
+            include_prev = 1 if include_prev_raw else 0
+        else:
+            include_prev = int(include_prev_raw)
+
         view_builder = AugmentationViewBuilder(
             transform=transform,
             repeat_factor=self.cfg.get("repeat_factor", 2),
-            include_prev=self.cfg.get("include_prev", True)
+            num_prev=include_prev,
         )
         
         self.train_view_ds = ViewDataset(self.train_ds, view_builder)

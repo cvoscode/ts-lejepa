@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from ..core.base_encoder import BaseEncoder
+from .layers import ChannelMixer
 
 
 class LSTMEncoder(BaseEncoder):
@@ -19,13 +20,27 @@ class LSTMEncoder(BaseEncoder):
         hidden_channels: int = 64, 
         num_layers: int = 2,
         dropout: float = 0.2, 
-        bidirectional: bool = True
+        bidirectional: bool = True,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
         
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         self.bidirectional = bidirectional
+
+        self.channel_mixer = ChannelMixer(
+            input_channels,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
         
         self.lstm = nn.LSTM(
             input_size=input_channels,
@@ -60,6 +75,7 @@ class LSTMEncoder(BaseEncoder):
             emb: [B, L, D]
         """
         # LSTM expects [B, L, C]
+        x = self.channel_mixer(x)
         x_seq = x.transpose(1, 2)
         
         # [B, L, hidden*2]
@@ -84,13 +100,27 @@ class GRUEncoder(BaseEncoder):
         hidden_channels: int = 64, 
         num_layers: int = 2,
         dropout: float = 0.2, 
-        bidirectional: bool = True
+        bidirectional: bool = True,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
         
         self.hidden_channels = hidden_channels
         self.num_layers = num_layers
         self.bidirectional = bidirectional
+
+        self.channel_mixer = ChannelMixer(
+            input_channels,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
         
         self.gru = nn.GRU(
             input_size=input_channels,
@@ -116,6 +146,7 @@ class GRUEncoder(BaseEncoder):
             init.constant_(m.bias, 0)
 
     def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.channel_mixer(x)
         x_seq = x.transpose(1, 2)
         gru_out, _ = self.gru(x_seq)
         emb = self.encoder_head(gru_out)

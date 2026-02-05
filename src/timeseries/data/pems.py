@@ -11,7 +11,18 @@ import random
 import lightning as L
 from typing import Optional, List
 from omegaconf import DictConfig
-from ..augementation.v1 import TimeSeriesTransform
+from ..transforms.base import Transform
+from ..transforms.compose import Compose, RandomApply, OneOf
+from ..transforms.ops import (
+    Scaling,
+    Drift,
+    FeatureJitter,
+    AddGaussianNoise,
+    FrequencyMask,
+    MagnitudeWarp,
+    TemporalCrop,
+    TemporalBlockMask,
+)
 from .probe_dataset import ForecastProbeDataset
 from .view_builders import AugmentationViewBuilder
 from .view_dataset import ViewDataset, collate_batches
@@ -19,6 +30,60 @@ from .window_dataset import WindowDataset
 from ..preprocessing.scalers import TorchStandardScaler
 from ..preprocessing.time_encoding import encode_timestamps_torch, NUM_TIME_FEATURES
 from dataclasses import dataclass
+
+
+class IdentityTransform(Transform):
+    """No-op transform for disabling augmentation."""
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+def build_ssl_transform(
+    *,
+    output_length: int,
+    scale_range: tuple[float, float] = (1.0, 1.0),
+    crop_ratio_range: tuple[float, float] = (1.0, 1.0),
+    jitter_std: float = 0.0,
+    p_noise: float = 0.0,
+    p_freq_mask: float = 0.0,
+    max_freq_ratio: float = 0.0,
+    p_temporal_mask: float = 0.0,
+    p_magnitude_warp: float = 0.0,
+    p_temporal_crop: float = 0.0,
+    p_transform: float = 0.0,
+) -> Transform:
+    """Build a configurable SSL augmentation pipeline using the new transform stack."""
+    ops = [Scaling(scale_range=scale_range), Drift()]
+
+    if jitter_std and jitter_std > 0:
+        ops.append(FeatureJitter(jitter_std=jitter_std))
+    if p_noise and p_noise > 0:
+        ops.append(AddGaussianNoise(p=p_noise))
+    if p_freq_mask and p_freq_mask > 0:
+        ops.append(FrequencyMask(p=p_freq_mask, max_freq_ratio=max_freq_ratio))
+    if p_magnitude_warp and p_magnitude_warp > 0:
+        ops.append(MagnitudeWarp(p=p_magnitude_warp))
+
+    pipeline = []
+    if ops and p_transform and p_transform > 0:
+        pipeline.append(RandomApply(OneOf(ops), p=p_transform))
+
+    if p_temporal_crop and p_temporal_crop > 0:
+        pipeline.append(
+            RandomApply(
+                TemporalCrop(output_length=output_length, crop_ratio_range=crop_ratio_range),
+                p=p_temporal_crop,
+            )
+        )
+
+    if p_temporal_mask and p_temporal_mask > 0:
+        pipeline.append(TemporalBlockMask(p=p_temporal_mask))
+
+    if not pipeline:
+        return IdentityTransform()
+
+    return Compose(pipeline)
 
 def download_url(url: str, root_dir: str) -> str:
     os.makedirs(root_dir, exist_ok=True)
@@ -185,25 +250,31 @@ class PeMS08DataModule(L.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.save_hyperparameters()
-        self.aug_transform = TimeSeriesTransform(
-            output_length=self.cfg.window_size, 
-            scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)), 
-            jitter_std=getattr(self.cfg, "jitter_std", 0.1), 
-            p_noise=getattr(self.cfg, "p_noise", 0.3), 
+        self.aug_transform = build_ssl_transform(
+            output_length=self.cfg.window_size,
+            scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)),
+            crop_ratio_range=getattr(self.cfg, "crop_ratio_range", (1.0, 1.0)),
+            jitter_std=getattr(self.cfg, "jitter_std", 0.1),
+            p_noise=getattr(self.cfg, "p_noise", 0.3),
             p_freq_mask=getattr(self.cfg, "p_freq_mask", 0.0),
             max_freq_ratio=getattr(self.cfg, "max_freq_ratio", 0.0),
             p_temporal_mask=getattr(self.cfg, "p_temporal_mask", 0.0),
-            p_transform=getattr(self.cfg, "p_transform", 0.7)
+            p_magnitude_warp=getattr(self.cfg, "p_magnitude_warp", 0.3),
+            p_temporal_crop=getattr(self.cfg, "p_temporal_crop", 0.0),
+            p_transform=getattr(self.cfg, "p_transform", 0.7),
         )
-        self.test_transform = TimeSeriesTransform(
-            output_length=self.cfg.window_size, 
+        self.test_transform = build_ssl_transform(
+            output_length=self.cfg.window_size,
             scale_range=(1.0, 1.0),
-            jitter_std=0.0, 
-            p_noise=0.0, 
+            crop_ratio_range=(1.0, 1.0),
+            jitter_std=0.0,
+            p_noise=0.0,
             p_freq_mask=0.0,
             max_freq_ratio=0.0,
             p_temporal_mask=0.0,
-            p_transform=0.0
+            p_magnitude_warp=0.0,
+            p_temporal_crop=0.0,
+            p_transform=0.0,
         )
         self.scaler = TorchStandardScaler()
 
@@ -504,7 +575,7 @@ class PeMS08MultiScaleDataModule(L.LightningDataModule):
         # Local (stronger) views of t0 (cropped smaller, then resized back to window_size)
         local_crop_ratio_range = getattr(self.cfg, "local_crop_ratio_range", (0.2, 0.5))
 
-        self.global_aug_transform = TimeSeriesTransform(
+        self.global_aug_transform = build_ssl_transform(
             output_length=window_size,
             scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)),
             crop_ratio_range=global_crop_ratio_range,
@@ -513,9 +584,11 @@ class PeMS08MultiScaleDataModule(L.LightningDataModule):
             p_freq_mask=getattr(self.cfg, "p_freq_mask", 0.0),
             max_freq_ratio=getattr(self.cfg, "max_freq_ratio", 0.0),
             p_temporal_mask=getattr(self.cfg, "p_temporal_mask", 0.9),
+            p_magnitude_warp=getattr(self.cfg, "p_magnitude_warp", 0.3),
+            p_temporal_crop=getattr(self.cfg, "p_temporal_crop", 1.0),
             p_transform=getattr(self.cfg, "p_transform_global", getattr(self.cfg, "p_transform", 0.7)),
         )
-        self.local_aug_transform = TimeSeriesTransform(
+        self.local_aug_transform = build_ssl_transform(
             output_length=window_size,
             scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)),
             crop_ratio_range=local_crop_ratio_range,
@@ -524,11 +597,13 @@ class PeMS08MultiScaleDataModule(L.LightningDataModule):
             p_freq_mask=getattr(self.cfg, "p_freq_mask", 0.0),
             max_freq_ratio=getattr(self.cfg, "max_freq_ratio", 0.0),
             p_temporal_mask=getattr(self.cfg, "p_temporal_mask", 0.9),
+            p_magnitude_warp=getattr(self.cfg, "p_magnitude_warp", 0.3),
+            p_temporal_crop=getattr(self.cfg, "p_temporal_crop", 1.0),
             p_transform=getattr(self.cfg, "p_transform_local", getattr(self.cfg, "p_transform", 0.7)),
         )
 
         # Validation/test: deterministic, no augmentation (all views become identical resizes).
-        self.eval_transform = TimeSeriesTransform(
+        self.eval_transform = build_ssl_transform(
             output_length=window_size,
             scale_range=(1.0, 1.0),
             crop_ratio_range=(1.0, 1.0),
@@ -537,6 +612,8 @@ class PeMS08MultiScaleDataModule(L.LightningDataModule):
             p_freq_mask=0.0,
             max_freq_ratio=0.0,
             p_temporal_mask=0.0,
+            p_magnitude_warp=0.0,
+            p_temporal_crop=0.0,
             p_transform=0.0,
         )
 
@@ -752,14 +829,17 @@ class PeMS08SSLDataModule(L.LightningDataModule):
 
         self.scaler = TorchStandardScaler()
 
-        self.transform = TimeSeriesTransform(
+        self.transform = build_ssl_transform(
             output_length=self.cfg.window_size,
             scale_range=getattr(self.cfg, "scale_range", (1.0, 1.0)),
+            crop_ratio_range=getattr(self.cfg, "crop_ratio_range", (1.0, 1.0)),
             jitter_std=getattr(self.cfg, "jitter_std", 0.1),
             p_noise=getattr(self.cfg, "p_noise", 0.3),
             p_freq_mask=getattr(self.cfg, "p_freq_mask", 0.0),
             max_freq_ratio=getattr(self.cfg, "max_freq_ratio", 0.0),
             p_temporal_mask=getattr(self.cfg, "p_temporal_mask", 0.8),
+            p_magnitude_warp=getattr(self.cfg, "p_magnitude_warp", 0.3),
+            p_temporal_crop=getattr(self.cfg, "p_temporal_crop", 0.0),
             p_transform=getattr(self.cfg, "p_transform", 0.7),
         )
 
@@ -767,7 +847,12 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         PeMS08(root="./data/pems08", mask_zeros=True)
 
     def _make_view_dataset(self, data: torch.Tensor, time_features: torch.Tensor, *, repeat_factor: int) -> ViewDataset:
-        include_prev = bool(getattr(self.cfg, "include_prev", True))
+        # Handle include_prev as bool or int
+        include_prev_raw = getattr(self.cfg, "include_prev", True)
+        if isinstance(include_prev_raw, bool):
+            include_prev = 1 if include_prev_raw else 0
+        else:
+            include_prev = int(include_prev_raw)
         prev_shift = int(getattr(self.cfg, "prev_shift", getattr(self.cfg, "temporal_shift", 10)))
         horizon = int(getattr(self.cfg, "target_window_size", 0))
 
@@ -781,10 +866,14 @@ class PeMS08SSLDataModule(L.LightningDataModule):
             horizon=horizon,
         )
 
+        # Always include clean t0 for proper probe training
+        include_clean_t0 = bool(getattr(self.cfg, "include_clean_t0", True))
+        
         view_builder = AugmentationViewBuilder(
             transform=self.transform,
             repeat_factor=int(repeat_factor),
-            include_prev=include_prev,
+            num_prev=include_prev,
+            include_clean_t0=include_clean_t0,
         )
 
         return ViewDataset(window_ds, view_builder)

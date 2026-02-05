@@ -11,11 +11,11 @@ from torch.utils.data import Dataset
 
 @dataclass(frozen=True)
 class WindowSample:
-    """Container for a single window sample and optional t-1 context."""
+    """Container for a single window sample and optional previous contexts."""
     window: torch.Tensor
     time_features: Optional[torch.Tensor] = None
-    prev_window: Optional[torch.Tensor] = None
-    prev_time_features: Optional[torch.Tensor] = None
+    prev_windows: Optional[list[torch.Tensor]] = None  # List of [t-1, t-2, ..., t-N] windows
+    prev_time_features: Optional[list[torch.Tensor]] = None  # Corresponding time features
     targets: Optional[torch.Tensor] = None
     future_times: Optional[torch.Tensor] = None
     time_index: Optional[torch.Tensor] = None
@@ -36,7 +36,7 @@ class WindowDataset(Dataset):
         *,
         window_size: int,
         stride: int = 1,
-        include_prev: bool = False,
+        include_prev: int | bool = 0,
         prev_shift: Optional[int] = None,
         sensors: Optional[list[int]] = None,
         horizon: int = 0,
@@ -48,8 +48,9 @@ class WindowDataset(Dataset):
             time_features: Optional time covariates [T, F_time].
             window_size: Window length.
             stride: Step between window starts.
-            include_prev: Whether to also expose a t-1 window.
-            prev_shift: Shift between t0 and t-1 windows.
+            include_prev: Number of previous windows to include (0=none, 1=t-1, 2=t-1,t-2, etc.).
+                         Can also be bool for backward compatibility (True=1, False=0).
+            prev_shift: Shift between consecutive previous windows.
             sensors: Optional subset of sensors.
             horizon: Forecast horizon. If > 0, returns targets and future_times.
         """
@@ -60,15 +61,24 @@ class WindowDataset(Dataset):
         self.time_features = time_features
         self.window_size = int(window_size)
         self.stride = int(stride)
-        self.include_prev = bool(include_prev)
+        
+        # Handle bool or int for include_prev
+        if isinstance(include_prev, bool):
+            self.num_prev = 1 if include_prev else 0
+        else:
+            self.num_prev = int(include_prev)
+        
+        if self.num_prev < 0:
+            raise ValueError(f"include_prev must be >= 0, got {include_prev}")
+        
         self.prev_shift = int(prev_shift) if prev_shift is not None else 0
         self.sensors = sensors if sensors is not None else list(range(self.data.shape[0]))
         self.horizon = int(horizon)
 
-        if self.include_prev and self.prev_shift <= 0:
-            raise ValueError("prev_shift must be > 0 when include_prev is True")
+        if self.num_prev > 0 and self.prev_shift <= 0:
+            raise ValueError("prev_shift must be > 0 when include_prev > 0")
 
-        total_shift = self.prev_shift if self.include_prev else 0
+        total_shift = self.prev_shift * self.num_prev
         max_start = self.data.shape[1] - self.window_size - self.horizon
         self.num_windows = (max_start - total_shift) // self.stride + 1
         self.num_windows = max(0, self.num_windows)
@@ -78,8 +88,8 @@ class WindowDataset(Dataset):
         return self.num_windows
 
     def __getitem__(self, idx: int) -> WindowSample:
-        """Return a window and optional previous window for invariance mixing."""
-        base_start = (self.prev_shift if self.include_prev else 0) + idx * self.stride
+        """Return a window and optional previous windows for invariance mixing."""
+        base_start = (self.prev_shift * self.num_prev) + idx * self.stride
 
         window = self.data[self.sensors, base_start : base_start + self.window_size]
         time_feats = (
@@ -88,13 +98,21 @@ class WindowDataset(Dataset):
             else self.time_features[base_start : base_start + self.window_size]
         )
 
-        prev_window = None
-        prev_time = None
-        if self.include_prev:
-            prev_start = base_start - self.prev_shift
-            prev_window = self.data[self.sensors, prev_start : prev_start + self.window_size]
-            if self.time_features is not None:
-                prev_time = self.time_features[prev_start : prev_start + self.window_size]
+        prev_windows = None
+        prev_times = None
+        if self.num_prev > 0:
+            prev_windows = []
+            prev_times = [] if self.time_features is not None else None
+            
+            # Collect t-1, t-2, ..., t-N windows
+            for i in range(1, self.num_prev + 1):
+                prev_start = base_start - (i * self.prev_shift)
+                prev_window = self.data[self.sensors, prev_start : prev_start + self.window_size]
+                prev_windows.append(prev_window)
+                
+                if self.time_features is not None:
+                    prev_t = self.time_features[prev_start : prev_start + self.window_size]
+                    prev_times.append(prev_t)
         
         targets = None
         future_times = None
@@ -112,8 +130,8 @@ class WindowDataset(Dataset):
         return WindowSample(
             window=window,
             time_features=time_feats,
-            prev_window=prev_window,
-            prev_time_features=prev_time,
+            prev_windows=prev_windows,
+            prev_time_features=prev_times,
             targets=targets,
             future_times=future_times,
             time_index=time_index,

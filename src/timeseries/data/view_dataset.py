@@ -67,7 +67,7 @@ class ViewDataset(Dataset):
         views, view_times = self.view_builder.build_views(
             sample.window,
             sample.time_features,
-            prev_window=sample.prev_window,
+            prev_windows=sample.prev_windows,
             prev_time_features=sample.prev_time_features,
         )
         

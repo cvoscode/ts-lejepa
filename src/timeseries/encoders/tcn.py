@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+
+from ..core.base_encoder import BaseEncoder
+from .layers import ChannelMixer
+
 
 class ResidualBlock1d(nn.Module):
     """
@@ -60,102 +66,91 @@ class MultiScalePool(nn.Module):
         out = self.norm(out)  # [B, C]
         return out
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        layers = []
-        in_dim = input_dim
-        
-        # Hidden Layers
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(in_dim, h_dim))
-            layers.append(norm_layer(h_dim))
-            layers.append(nn.ReLU())
-            in_dim = h_dim
-            
-        # --- FIX 1: Letzte Schicht separat behandeln ---
-        self.net = nn.Sequential(*layers)
-        
-        # Die letzte Projektion auf die Dimension, in der der Loss berechnet wird
-        self.last_layer = nn.Linear(in_dim, output_dim)
-        self.last_norm = nn.LayerNorm(output_dim)
-        #1 RMSNorm ok
-        #1 LayerNorm elementwise false.. lower but instable
-        #2 LayerNorm elementwise True.. similar to rms
-        #3 LayerNorm similar to rms, layer
+class TCNEncoder(BaseEncoder):
+    """Temporal CNN encoder for multivariate time series.
+    
+    Uses strided convolutions to progressively downsample the temporal dimension,
+    then returns per-timestep embeddings.
+    """
 
-
-    def forward(self, x):
-        x = self.net(x)
-        x = self.last_layer(x)
-        x= self.last_norm(x)
-        return x
-
-class TimeSeriesEncoder(nn.Module):
-    def __init__(self, input_channels: int = 170, encoder_output_dim: int = 12, 
-                 proj_dim: int = 128):
-        super().__init__()
-        # LeJEPA_Forecaster expects the backbone to expose .output_dim
-        self.output_dim = encoder_output_dim
+    def __init__(
+        self,
+        input_channels: int,
+        output_dim: int,
+        pool_mode: str = "mean",
+        hidden_channels: int = 64,
+        num_layers: int = 2,
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
+    ):
+        super().__init__(input_channels, output_dim, pool_mode)
         
-      
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+
+        self.channel_mixer = ChannelMixer(
+            input_channels,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
         
+        # Stem
         self.stem = nn.Sequential(
-            nn.Conv1d(input_channels, 64, kernel_size=3, padding=1, bias=False),
-            nn.LayerNorm(64),
+            nn.Conv1d(input_channels, hidden_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=False),
+            nn.LayerNorm(hidden_channels),
             nn.ReLU()
         )
-        self.layer1 = ResidualBlock1d(64, 128, stride=2)
-        self.pooling = MultiScalePool(128)
-        self.encoder_head = nn.Linear(128, encoder_output_dim)
-
-        self.proj = MLP(
-            input_dim=encoder_output_dim, 
-            hidden_dims=[proj_dim, proj_dim], # Letzter dim ist output via last_layer
-            output_dim=proj_dim,
-            norm_layer=nn.LayerNorm
+        
+        # Residual blocks with stride=1 to preserve temporal dimension
+        layers = []
+        in_ch = hidden_channels
+        out_ch = hidden_channels * 2
+        for i in range(num_layers):
+            layers.append(ResidualBlock1d(in_ch, out_ch, kernel_size=kernel_size, stride=1, dropout=dropout))
+            in_ch = out_ch
+        self.backbone = nn.Sequential(*layers)
+        
+        # Project to output dimension per timestep
+        self.encoder_head = nn.Sequential(
+            nn.Linear(in_ch, output_dim),
+            nn.LayerNorm(output_dim)
         )
         
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            # Orthogonale Initialisierung hilft bei Dekorrelation
             init.orthogonal_(m.weight)
             if m.bias is not None:
                 init.constant_(m.bias, 0)
         elif isinstance(m, nn.Conv1d):
-            # Kaiming für Convs (Best Practice für ReLU)
             init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
         elif isinstance(m, nn.LayerNorm):
             init.constant_(m.weight, 1)
             init.constant_(m.bias, 0)
 
-    def _backbone_forward(self, x_flat: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x_flat)
-        x = self.layer1(x)
-        x = self.pooling(x)  # MultiScalePool returns [B, C] directly
-        emb = self.encoder_head(x)
-        return emb
-
-    def forward(self, x: torch.Tensor, time_features: torch.Tensor | None = None, return_proj: bool = False):
-        """Encode a window; supports x as [B*V, C, L] or [B, V, C, L]."""
-        _ = time_features  # accepted for API compatibility; not used
-
-        if x.dim() == 4:
-            N, V, C, L = x.shape
-            x_flat = x.view(N * V, C, L)
-            emb = self._backbone_forward(x_flat)
-            if return_proj:
-                proj = self.proj(emb)
-                return emb, proj
-            return emb.view(N, V, -1)
-
-        if x.dim() != 3:
-            raise ValueError(f"Expected x to have 3 or 4 dims, got shape={tuple(x.shape)}")
-
-        emb = self._backbone_forward(x)
-        if return_proj:
-            proj = self.proj(emb)
-            return emb, proj
+    def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, L]
+        Returns:
+            emb: [B, L, D]
+        """
+        # x: [B, C, L]
+        x = self.channel_mixer(x)
+        x = self.stem(x)      # [B, hidden_channels, L]
+        x = self.backbone(x)  # [B, hidden_channels*2^num_layers, L]
+        
+        # Transpose to [B, L, C] for linear projection
+        x = x.transpose(1, 2)  # [B, L, C]
+        emb = self.encoder_head(x)  # [B, L, D]
+        
         return emb

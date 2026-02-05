@@ -5,7 +5,20 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from ..core.base_encoder import BaseEncoder
-from .layers import MultiScalePool
+from .layers import MultiScalePool, ChannelMixer
+
+
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm over channel dimension for [B, C, T] tensors."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T] -> [B, T, C], normalize last dim, -> [B, C, T]
+        x_t = x.transpose(1, 2)
+        x_n = self.norm(x_t)
+        return x_n.transpose(1, 2)
 
 
 class DilatedResidualBlock1d(nn.Module):
@@ -32,7 +45,7 @@ class DilatedResidualBlock1d(nn.Module):
             dilation=dilation,
             bias=False,
         )
-        self.bn1 = nn.LayerNorm(out_channels)
+        self.bn1 = ChannelLayerNorm(out_channels)
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
 
@@ -44,13 +57,13 @@ class DilatedResidualBlock1d(nn.Module):
             dilation=dilation,
             bias=False,
         )
-        self.bn2 = nn.LayerNorm(out_channels)
+        self.bn2 = ChannelLayerNorm(out_channels)
 
         self.downsample = nn.Identity()
         if in_channels != out_channels:
             self.downsample = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.LayerNorm(out_channels),
+                ChannelLayerNorm(out_channels),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -85,8 +98,22 @@ class CNNEncoder(BaseEncoder):
         kernel_size: int = 5,
         dilations: tuple[int, ...] = (1, 2, 4, 8),
         dropout: float = 0.1,
+        channel_mixer: str = "none",
+        channel_mixer_reduction: int = 4,
+        channel_mixer_attn_dim: int = 64,
+        channel_mixer_attn_heads: int = 4,
+        channel_mixer_attn_dropout: float = 0.0,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
+
+        self.channel_mixer = ChannelMixer(
+            input_channels,
+            mode=channel_mixer,
+            reduction=channel_mixer_reduction,
+            attn_dim=channel_mixer_attn_dim,
+            attn_heads=channel_mixer_attn_heads,
+            attn_dropout=channel_mixer_attn_dropout,
+        )
 
         if kernel_size % 2 == 0:
             raise ValueError("kernel_size must be odd")
@@ -94,7 +121,7 @@ class CNNEncoder(BaseEncoder):
         stem_pad = (kernel_size - 1) // 2
         self.stem = nn.Sequential(
             nn.Conv1d(input_channels, stem_channels, kernel_size=kernel_size, padding=stem_pad, bias=False),
-            nn.LayerNorm(stem_channels),
+            ChannelLayerNorm(stem_channels),
             nn.GELU(),
         )
 
@@ -137,6 +164,7 @@ class CNNEncoder(BaseEncoder):
 
     def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
         # x shape: [Batch, Channels, Time]
+        x = self.channel_mixer(x)
         x = self.stem(x)
         x = self.backbone(x) # [B, C_out, T]
         

@@ -18,6 +18,10 @@ class SSLPretrainModule(L.LightningModule):
     """LightningModule for LeJEPA SSL with optional probe metrics.
 
     The probe is evaluation-only and does not backpropagate into the encoder.
+    It uses the CLEAN t0 view (unaugmented) for proper forecasting supervision.
+    
+    View structure expected: [t-N, ..., t-1, t0_clean, t0_aug1, ..., t0_augR]
+    The clean_t0_index should point to the unaugmented t0 view.
     """
 
     def __init__(
@@ -28,6 +32,11 @@ class SSLPretrainModule(L.LightningModule):
         weight_decay: float = 5e-2,
         probe: Optional[ForecastProbe] = None,
         probe_loss_weight: float = 0.0,
+        probe_lr: Optional[float] = None,
+        probe_weight_decay: Optional[float] = None,
+        probe_start_epoch: int = 0,
+        probe_start_step: int = 0,
+        clean_t0_index: Optional[int] = None,  # Index of clean t0 view for probe
     ) -> None:
         super().__init__()
         self.ssl_core = ssl_core
@@ -35,6 +44,21 @@ class SSLPretrainModule(L.LightningModule):
         self.weight_decay = float(weight_decay)
         self.probe = probe
         self.probe_loss_weight = float(probe_loss_weight)
+        self.probe_lr = float(probe_lr) if probe_lr is not None else None
+        self.probe_weight_decay = float(probe_weight_decay) if probe_weight_decay is not None else None
+        self.probe_start_epoch = int(probe_start_epoch)
+        self.probe_start_step = int(probe_start_step)
+        # Default: clean t0 is at index num_prev_views (first t0 after prev views)
+        self._clean_t0_index = clean_t0_index if clean_t0_index is not None else ssl_core.num_prev_views
+
+    def _probe_is_active(self) -> bool:
+        if self.probe is None:
+            return False
+        if self.current_epoch < self.probe_start_epoch:
+            return False
+        if self.global_step < self.probe_start_step:
+            return False
+        return True
 
     def training_step(self, batch: Batch, batch_idx: int):
         """Compute SSL loss and log probe metrics if targets are present."""
@@ -43,10 +67,21 @@ class SSLPretrainModule(L.LightningModule):
         self.log("train/ssl_loss", ssl_res.total_loss, prog_bar=True, batch_size=batch_size)
         self.log("train/inv_loss", ssl_res.inv_loss, batch_size=batch_size)
         self.log("train/sigreg", ssl_res.sigreg_loss, batch_size=batch_size)
+        
+        # Log temporal alignment if available (measures how well prev views align with t0)
+        if ssl_res.temporal_alignment is not None:
+            self.log("train/temporal_alignment", ssl_res.temporal_alignment, batch_size=batch_size)
+        
+        # Log embedding health diagnostics
+        if ssl_res.embedding_std is not None:
+            self.log("train/embedding_std", ssl_res.embedding_std, batch_size=batch_size)
+        if ssl_res.feature_collapse_ratio is not None:
+            self.log("train/feature_collapse_ratio", ssl_res.feature_collapse_ratio, batch_size=batch_size)
 
-        if self.probe is not None and batch.targets is not None:
+        if self._probe_is_active() and batch.targets is not None:
             probe_loss = self._probe_loss(batch)
             self.log("train/probe_loss", probe_loss, prog_bar=False, batch_size=batch_size)
+            self._log_probe_mae_unscaled(batch, batch_size=batch_size, stage="train")
             return ssl_res.total_loss + self.probe_loss_weight * probe_loss
 
         return ssl_res.total_loss
@@ -58,16 +93,29 @@ class SSLPretrainModule(L.LightningModule):
         self.log("val/ssl_loss", ssl_res.total_loss, prog_bar=True, batch_size=batch_size)
         self.log("val/inv_loss", ssl_res.inv_loss, batch_size=batch_size)
         self.log("val/sigreg", ssl_res.sigreg_loss, batch_size=batch_size)
+        
+        # Log temporal alignment if available
+        if ssl_res.temporal_alignment is not None:
+            self.log("val/temporal_alignment", ssl_res.temporal_alignment, batch_size=batch_size)
+        
+        # Log embedding health diagnostics
+        if ssl_res.embedding_std is not None:
+            self.log("val/embedding_std", ssl_res.embedding_std, batch_size=batch_size)
+        if ssl_res.feature_collapse_ratio is not None:
+            self.log("val/feature_collapse_ratio", ssl_res.feature_collapse_ratio, batch_size=batch_size)
 
-        if self.probe is not None and batch.targets is not None:
+        if self._probe_is_active() and batch.targets is not None:
             probe_loss = self._probe_loss(batch)
             self.log("val/probe_loss", probe_loss, prog_bar=False, batch_size=batch_size)
-            self._log_probe_mae_unscaled(batch, batch_size=batch_size)
+            self._log_probe_mae_unscaled(batch, batch_size=batch_size, stage="val")
 
         return ssl_res.total_loss
 
-    def _log_probe_mae_unscaled(self, batch: Batch, *, batch_size: int) -> None:
-        """Log unscaled MAE for probe forecasts when scaler is available."""
+    def _log_probe_mae_unscaled(self, batch: Batch, *, batch_size: int, stage: str) -> None:
+        """Log unscaled MAE for probe forecasts when scaler is available.
+        
+        Uses the CLEAN t0 view (at _clean_t0_index) for proper evaluation.
+        """
         scaler = getattr(self, "scaler", None)
         if scaler is None and self.trainer is not None:
              scaler = getattr(self.trainer.datamodule, "scaler", None)
@@ -76,50 +124,84 @@ class SSLPretrainModule(L.LightningModule):
             return
 
         views = batch.views
-        t0_view = views[:, -1, ...]
+        # Use clean t0 view (unaugmented) for probe evaluation
+        clean_t0_view = views[:, self._clean_t0_index, ...]
+        
         with torch.no_grad():
-            emb = self.ssl_core.encoder(t0_view)
-            if emb.dim() == 3:
-                emb = emb.mean(dim=1)
-        preds = self.probe(emb.detach(), batch.future_times)
+            emb = self._encode_probe_features(clean_t0_view)
+        
+        if not self._probe_is_active():
+            return
+
+        preds = self.probe(emb, batch.future_times)
         targets = batch.targets
+        
+        # Ensure correct shape: targets should be [B, C, H] to match preds
         if targets.shape[1] == preds.shape[2] and targets.shape[2] == preds.shape[1]:
             targets = targets.transpose(1, 2)
 
         scaler = scaler.to(preds.device)
         preds_unscaled = scaler.inverse_transform(preds)
         targets_unscaled = scaler.inverse_transform(targets)
-        
-        # Ensure correct shape match for MAE
-        if preds_unscaled.shape != targets_unscaled.shape:
-             # Try simple broadcast or view? 
-             # For now, let's assume they match or l1_loss handles it, but robust code checks.
-             pass
 
         mae_unscaled = F.l1_loss(preds_unscaled, targets_unscaled)
-        self.log("val/probe_mae_unscaled", mae_unscaled, prog_bar=True, batch_size=batch_size)
+        self.log(f"{stage}/probe_mae_unscaled", mae_unscaled, prog_bar=True, batch_size=batch_size)
 
     def _probe_loss(self, batch: Batch) -> torch.Tensor:
-        """Compute probe loss without affecting encoder gradients."""
+        """Compute probe loss using the CLEAN t0 view (not augmented).
+        
+        This ensures the probe learns to forecast from ground truth embeddings,
+        not from augmented/corrupted views.
+        """
+        views = batch.views
+        # Use clean t0 view (unaugmented) at the known index
+        clean_t0_view = views[:, self._clean_t0_index, ...]
+        
         with torch.no_grad():
-            views = batch.views
-            t0_view = views[:, -1, ...]
-            emb = self.ssl_core.encoder(t0_view)
-            if emb.dim() == 3:
-                emb = emb.mean(dim=1)
+            emb = self._encode_probe_features(clean_t0_view)
 
-        preds = self.probe(emb.detach(), batch.future_times)
+        preds = self.probe(emb, batch.future_times)
         targets = batch.targets
+        
+        # Ensure correct shape: targets should be [B, C, H] to match preds
         if targets.shape[1] == preds.shape[2] and targets.shape[2] == preds.shape[1]:
             targets = targets.transpose(1, 2)
+        
         return F.mse_loss(preds, targets)
+
+    def _encode_probe_features(self, clean_t0_view: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
+        encoder = self.ssl_core.encoder
+        if hasattr(encoder, "forward_multilevel"):
+            emb = encoder.forward_multilevel(clean_t0_view)
+        else:
+            emb = encoder(clean_t0_view)
+
+        if isinstance(emb, (list, tuple)):
+            processed: list[torch.Tensor] = []
+            for level in emb:
+                if level.dim() == 3:
+                    level = level.mean(dim=1)
+                processed.append(level)
+            return processed
+
+        if emb.dim() == 3:
+            emb = emb.mean(dim=1)
+        return emb
 
     def configure_optimizers(self):
         """AdamW optimizer for SSL core and optional probe head."""
-        params = list(self.ssl_core.parameters())
+        params = [{"params": self.ssl_core.parameters(), "lr": self.lr, "weight_decay": self.weight_decay}]
         if self.probe is not None:
-            params += list(self.probe.parameters())
-        return torch.optim.AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
+            params.append(
+                {
+                    "params": self.probe.parameters(),
+                    "lr": self.probe_lr if self.probe_lr is not None else self.lr,
+                    "weight_decay": (
+                        self.probe_weight_decay if self.probe_weight_decay is not None else self.weight_decay
+                    ),
+                }
+            )
+        return torch.optim.AdamW(params)
 
 
 __all__ = ["SSLPretrainModule"]

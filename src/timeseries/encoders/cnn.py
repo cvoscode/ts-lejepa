@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from ..core.base_encoder import BaseEncoder
-from .layers import MultiScalePool, ChannelMixer
+from ..preprocessing.time_encoding import NUM_TIME_FEATURES
+from .layers import MultiScalePool, ChannelMixer, TimeFeatureProjector
 
 
 class ChannelLayerNorm(nn.Module):
@@ -103,6 +104,7 @@ class CNNEncoder(BaseEncoder):
         channel_mixer_attn_dim: int = 64,
         channel_mixer_attn_heads: int = 4,
         channel_mixer_attn_dropout: float = 0.0,
+        num_time_features: int = NUM_TIME_FEATURES,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
 
@@ -113,6 +115,12 @@ class CNNEncoder(BaseEncoder):
             attn_dim=channel_mixer_attn_dim,
             attn_heads=channel_mixer_attn_heads,
             attn_dropout=channel_mixer_attn_dropout,
+        )
+
+        self.time_feature_proj = (
+            TimeFeatureProjector(int(num_time_features), input_channels)
+            if int(num_time_features) > 0
+            else None
         )
 
         if kernel_size % 2 == 0:
@@ -126,6 +134,7 @@ class CNNEncoder(BaseEncoder):
         )
 
         blocks: list[nn.Module] = []
+        self._level_channels: list[int] = []
         in_ch = stem_channels
         for i, d in enumerate(dilations):
             out_ch = stem_channels if i < len(dilations) - 1 else stem_channels * 2
@@ -138,12 +147,17 @@ class CNNEncoder(BaseEncoder):
                     dropout=dropout,
                 )
             )
+            self._level_channels.append(out_ch)
             in_ch = out_ch
-        self.backbone = nn.Sequential(*blocks)
+        self.backbone = nn.ModuleList(blocks)
 
-        # For temporal output (pool_mode="none"), we project per-step [B, C, T] -> [B, D, T] -> [B, T, D]
-        # For pooling, we might use MultiScalePool if requested, or BaseEncoder's simple pooling.
-        
+        # Per-level projection heads for forward_multilevel
+        self.level_heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(ch, output_dim), nn.LayerNorm(output_dim))
+            for ch in self._level_channels
+        ])
+
+        # Final head (same as last level head) for forward_backbone
         self.head = nn.Sequential(
             nn.Linear(in_ch, output_dim),
             nn.LayerNorm(output_dim),
@@ -162,14 +176,39 @@ class CNNEncoder(BaseEncoder):
             init.constant_(m.weight, 1)
             init.constant_(m.bias, 0)
 
+    def forward_multilevel(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> list[torch.Tensor]:
+        """Return pooled per-level embeddings for probe fusion.
+
+        Returns list of [B, output_dim] tensors, one per dilated block.
+        """
+        x = self.channel_mixer(x)
+        x = self._apply_time_features(x, time_features)
+        x = self.stem(x)
+        levels: list[torch.Tensor] = []
+        for block, head in zip(self.backbone, self.level_heads):
+            x = block(x)  # [B, C_i, T]
+            pooled = x.mean(dim=-1)  # [B, C_i]
+            levels.append(head(pooled))  # [B, output_dim]
+        return levels
+
     def forward_backbone(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
         # x shape: [Batch, Channels, Time]
         x = self.channel_mixer(x)
+        x = self._apply_time_features(x, time_features)
         x = self.stem(x)
-        x = self.backbone(x) # [B, C_out, T]
+        for block in self.backbone:
+            x = block(x)
         
         # Project channel dim to output_dim
         # [B, C, T] -> [B, T, C]
         x_t = x.transpose(1, 2)
         x_proj = self.head(x_t) # [B, T, D]
         return x_proj
+
+    def _apply_time_features(
+        self, x: torch.Tensor, time_features: torch.Tensor | None
+    ) -> torch.Tensor:
+        if time_features is None or self.time_feature_proj is None:
+            return x
+        time_emb = self.time_feature_proj(time_features).transpose(1, 2)
+        return x + time_emb

@@ -83,6 +83,18 @@ class ChannelMixer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mixer(x)
 
+
+class TimeFeatureProjector(nn.Module):
+    """Project time features [B, T, F] into a target feature dimension."""
+
+    def __init__(self, input_features: int, output_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(input_features, output_dim)
+        self.norm = nn.LayerNorm(output_dim)
+
+    def forward(self, time_features: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.proj(time_features))
+
 class MultiScalePool(nn.Module):
     """Combines average and max pooling with learned fusion."""
     def __init__(self, channels: int):

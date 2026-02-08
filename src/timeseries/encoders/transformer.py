@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from ..core.base_encoder import BaseEncoder
-from .layers import ChannelMixer
+from ..preprocessing.time_encoding import NUM_TIME_FEATURES
+from .layers import ChannelMixer, TimeFeatureProjector
 
 
 class PositionalEncoding(nn.Module):
@@ -42,6 +43,7 @@ class TransformerEncoder(BaseEncoder):
         channel_mixer_attn_dim: int = 64,
         channel_mixer_attn_heads: int = 4,
         channel_mixer_attn_dropout: float = 0.0,
+        num_time_features: int = NUM_TIME_FEATURES,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
 
@@ -55,17 +57,30 @@ class TransformerEncoder(BaseEncoder):
         )
         
         self.input_proj = nn.Linear(input_channels, output_dim)
+        self.time_feature_proj = (
+            TimeFeatureProjector(int(num_time_features), output_dim)
+            if int(num_time_features) > 0
+            else None
+        )
         self.pos_encoder = PositionalEncoding(output_dim)
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=output_dim,
-            nhead=n_heads,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=output_dim,
+                nhead=n_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+            for _ in range(n_layers)
+        ])
+        self.n_layers = n_layers
+        
+        # Per-layer projection heads for forward_multilevel
+        self.level_heads = nn.ModuleList([
+            nn.Linear(output_dim, output_dim) for _ in range(n_layers)
+        ])
         
         self.apply(self._init_weights)
     
@@ -83,13 +98,34 @@ class TransformerEncoder(BaseEncoder):
         x = self.channel_mixer(x)
         x = x.transpose(1, 2)
         x = self.input_proj(x) # [B, T, D]
-        
-        if time_features is not None:
-             # If time_features provided, we could concat or project them.
-             # For simplicity, we ignore them or assume they are already in x
-             # Or we can add them to embedding if dims match?
-             pass
+
+        x = self._apply_time_features(x, time_features)
 
         x = self.pos_encoder(x)
-        x = self.transformer(x)
+        for layer in self.layers:
+            x = layer(x)
         return x
+
+    def forward_multilevel(self, x: torch.Tensor, time_features: torch.Tensor | None = None) -> list[torch.Tensor]:
+        """Return pooled per-layer embeddings for probe fusion.
+
+        Returns list of [B, output_dim] tensors, one per transformer layer.
+        """
+        x = self.channel_mixer(x)
+        x = x.transpose(1, 2)
+        x = self.input_proj(x)
+        x = self._apply_time_features(x, time_features)
+        x = self.pos_encoder(x)
+        levels: list[torch.Tensor] = []
+        for layer, head in zip(self.layers, self.level_heads):
+            x = layer(x)  # [B, T, D]
+            pooled = x.mean(dim=1)  # [B, D]
+            levels.append(head(pooled))  # [B, D]
+        return levels
+
+    def _apply_time_features(
+        self, x: torch.Tensor, time_features: torch.Tensor | None
+    ) -> torch.Tensor:
+        if time_features is None or self.time_feature_proj is None:
+            return x
+        return x + self.time_feature_proj(time_features)

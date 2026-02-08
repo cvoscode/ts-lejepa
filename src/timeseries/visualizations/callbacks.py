@@ -4,22 +4,146 @@ import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
 import umap
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from ..core.types import Batch
 
 class VisualizationCallback(L.Callback):
-    def __init__(self, num_samples_plot=3, umap_every_n_epochs=1, num_umap_batches=10):
+    def __init__(
+        self,
+        num_samples_plot=3,
+        umap_every_n_epochs=1,
+        num_umap_batches=10,
+        sensor_indices=None,
+        sample_indices=None,
+        fixed_samples=False,
+        fixed_window_index=None,
+        fixed_window_stage="both",
+    ):
         """
         Args:
             num_samples_plot: Number of samples (time series) to plot.
             umap_every_n_epochs: UMAP is expensive, so only run it every N epochs.
             num_umap_batches: How many batches to collect for UMAP (more = more accurate, but slower).
+            sensor_indices: Optional list of sensor indices to plot (fixed order).
+            sample_indices: Optional list of batch sample indices to plot (fixed order).
+            fixed_samples: If True, use the first N samples each time instead of random.
+            fixed_window_index: If set, always visualize the same dataset index.
+            fixed_window_stage: "train", "val", or "both" (default) for fixed window.
         """
         super().__init__()
         self.num_samples_plot = num_samples_plot
         self.umap_every_n_epochs = umap_every_n_epochs
         self.num_umap_batches = num_umap_batches
+        self.sensor_indices = sensor_indices
+        self.sample_indices = sample_indices
+        self.fixed_samples = fixed_samples
+        self.fixed_window_index = fixed_window_index
+        self.fixed_window_stage = str(fixed_window_stage).lower()
+
+    def _get_fixed_batch(self, dataloader: DataLoader, stage: str):
+        if self.fixed_window_index is None:
+            return None
+        stage = str(stage).lower()
+        if self.fixed_window_stage not in {"both", stage}:
+            return None
+        dataset = getattr(dataloader, "dataset", None)
+        if dataset is None:
+            return None
+        index = int(self.fixed_window_index)
+        if index < 0 or index >= len(dataset):
+            return None
+        subset = Subset(dataset, [index])
+        collate_fn = getattr(dataloader, "collate_fn", None)
+        fixed_loader = DataLoader(
+            subset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=collate_fn,
+        )
+        try:
+            return next(iter(fixed_loader))
+        except Exception:
+            return None
+
+    def _plot_data_from_batch(self, batch, trainer, pl_module):
+        vs, target, view_times, future_times = self._unpack_batch(batch)
+
+        device = pl_module.device
+        vs = vs.to(device)
+        if target is not None:
+            target = target.to(device)
+        if view_times is not None:
+            view_times = view_times.to(device)
+        if future_times is not None:
+            future_times = future_times.to(device)
+
+        if vs.dim() == 5:
+            B, V, C, L, F = vs.shape
+        else:
+            B, V, C, L = vs.shape
+        if V < 2:
+            raise ValueError(f"Expected at least 2 views (prev/curr). Got V={V}.")
+        vs_flat = vs.reshape(B * V, *vs.shape[2:])
+
+        if view_times is not None:
+            view_times_flat = view_times.reshape(B * V, *view_times.shape[2:])
+            emb_all = self._backbone_forward(pl_module, vs_flat, view_times_flat)
+        else:
+            emb_all = self._backbone_forward(pl_module, vs_flat)
+
+        if emb_all.dim() == 3:
+            BV, T, D = emb_all.shape
+            emb_views = emb_all.view(B, V, T, D)
+            emb_t0 = emb_views[:, 1:-1, :, :].mean(dim=1)  # [B, T, D]
+            emb_flat = emb_t0.mean(dim=1)  # [B, D]
+        else:
+            BV, D = emb_all.shape
+            emb_views = emb_all.view(B, V, D)
+            emb_flat = emb_views[:, 1:-1, :].mean(dim=1)  # [B, D]
+
+        if getattr(pl_module, "use_covariates", False) and future_times is not None and hasattr(pl_module, "future_cov_encoder"):
+            future_cov_emb = pl_module.future_cov_encoder(future_times)
+            forecast_input = torch.cat([emb_flat, future_cov_emb], dim=-1)
+        else:
+            forecast_input = emb_flat
+
+        yhat = self._forecast_from_module(pl_module, forecast_input, future_times)
+        if target is None or yhat is None:
+            return None
+
+        if vs.dim() == 5:
+            input_seq = vs[:, 1:-1, :, :, :].mean(dim=1).mean(dim=-1)  # [B, C, L]
+        else:
+            input_seq = vs[:, 1:-1, :, :].mean(dim=1)  # [B, C, L]
+
+        if target.shape[1] == pl_module.horizon and target.shape[2] == pl_module.input_dim:
+            target = target.transpose(1, 2)
+
+        scaler = getattr(pl_module, "scaler", None)
+        if scaler is None and trainer is not None and getattr(trainer, "datamodule", None) is not None:
+            scaler = getattr(trainer.datamodule, "scaler", None)
+
+        if scaler is not None:
+            try:
+                scaler = scaler.to(input_seq.device)
+            except Exception:
+                pass
+
+            input_inv = scaler.inverse_transform(input_seq)
+            target_inv = scaler.inverse_transform(target)
+            yhat_inv = scaler.inverse_transform(yhat)
+        else:
+            input_inv = input_seq
+            target_inv = target
+            yhat_inv = yhat
+
+        return {
+            "input": input_inv.cpu(),
+            "target": target_inv.cpu(),
+            "prediction": yhat_inv.cpu(),
+        }
 
     @staticmethod
     def _unpack_batch(batch):
@@ -134,6 +258,7 @@ class VisualizationCallback(L.Callback):
             return
         
         val_loader = trainer.datamodule.val_dataloader()
+        fixed_batch = self._get_fixed_batch(val_loader, "val")
         
         # Containers for UMAP
         all_embeddings = []
@@ -150,6 +275,8 @@ class VisualizationCallback(L.Callback):
 
         try:
             with torch.no_grad():
+                if fixed_batch is not None:
+                    plot_data = self._plot_data_from_batch(fixed_batch, trainer, pl_module)
                 for i, batch in enumerate(val_loader):
                     if i >= self.num_umap_batches:
                         break
@@ -214,41 +341,8 @@ class VisualizationCallback(L.Callback):
                         all_times.append(time_indices)
                     
                     # Store plot data (only from the first batch)
-                    if i == 0 and target is not None and yhat is not None:
-                        # Input sequence for t0: average over repeated t0 views
-                        if vs.dim() == 5:
-                            input_seq = vs[:, 1:-1, :, :, :].mean(dim=1).mean(dim=-1)  # [B, C, L]
-                        else:
-                            input_seq = vs[:, 1:-1, :, :].mean(dim=1)  # [B, C, L]
-                        
-                        # Ensure target is [B, C, H]
-                        if target.shape[1] == pl_module.horizon and target.shape[2] == pl_module.input_dim:
-                            target = target.transpose(1, 2)
-                        
-                        # Inverse scaling (ensure scaler is on correct device)
-                        scaler = getattr(pl_module, "scaler", None)
-                        if scaler is None and trainer is not None and getattr(trainer, "datamodule", None) is not None:
-                            scaler = getattr(trainer.datamodule, "scaler", None)
-
-                        if scaler is not None:
-                            try:
-                                scaler = scaler.to(input_seq.device)
-                            except Exception:
-                                pass
-
-                            input_inv = scaler.inverse_transform(input_seq)
-                            target_inv = scaler.inverse_transform(target)
-                            yhat_inv = scaler.inverse_transform(yhat)
-                        else:
-                            input_inv = input_seq
-                            target_inv = target
-                            yhat_inv = yhat
-                            
-                        plot_data = {
-                            'input': input_inv.cpu(),
-                            'target': target_inv.cpu(),
-                            'prediction': yhat_inv.cpu()
-                        }
+                    if i == 0 and plot_data is None:
+                        plot_data = self._plot_data_from_batch(batch, trainer, pl_module)
         finally:
             if was_training:
                 pl_module.train()
@@ -277,6 +371,7 @@ class VisualizationCallback(L.Callback):
             return
         
         train_loader = trainer.datamodule.train_dataloader()
+        fixed_batch = self._get_fixed_batch(train_loader, "train")
         # Ensure optional attrs exist to avoid AttributeError when inspecting targets
         self._ensure_pl_module_attrs(pl_module)
         
@@ -293,6 +388,8 @@ class VisualizationCallback(L.Callback):
 
         try:
             with torch.no_grad():
+                if fixed_batch is not None:
+                    plot_data = self._plot_data_from_batch(fixed_batch, trainer, pl_module)
                 for i, batch in enumerate(train_loader):
                     if i >= self.num_umap_batches:
                         break
@@ -357,41 +454,8 @@ class VisualizationCallback(L.Callback):
                         all_times.append(time_indices)
                     
                     # Store plot data (only from the first batch)
-                    if i == 0 and target is not None and yhat is not None:
-                        # Input sequence for t0: average over repeated t0 views
-                        if vs.dim() == 5:
-                            input_seq = vs[:, 1:-1, :, :, :].mean(dim=1).mean(dim=-1)  # [B, C, L]
-                        else:
-                            input_seq = vs[:, 1:-1, :, :].mean(dim=1)  # [B, C, L]
-                        
-                        # Ensure target is [B, C, H]
-                        if target.shape[1] == pl_module.horizon and target.shape[2] == pl_module.input_dim:
-                            target = target.transpose(1, 2)
-                        
-                        # Inverse scaling (ensure scaler is on correct device)
-                        scaler = getattr(pl_module, "scaler", None)
-                        if scaler is None and trainer is not None and getattr(trainer, "datamodule", None) is not None:
-                            scaler = getattr(trainer.datamodule, "scaler", None)
-
-                        if scaler is not None:
-                            try:
-                                scaler = scaler.to(input_seq.device)
-                            except Exception:
-                                pass
-
-                            input_inv = scaler.inverse_transform(input_seq)
-                            target_inv = scaler.inverse_transform(target)
-                            yhat_inv = scaler.inverse_transform(yhat)
-                        else:
-                            input_inv = input_seq
-                            target_inv = target
-                            yhat_inv = yhat
-                            
-                        plot_data = {
-                            'input': input_inv.cpu(),
-                            'target': target_inv.cpu(),
-                            'prediction': yhat_inv.cpu()
-                        }
+                    if i == 0 and plot_data is None:
+                        plot_data = self._plot_data_from_batch(batch, trainer, pl_module)
         finally:
             if was_training:
                 pl_module.train()
@@ -440,40 +504,58 @@ class VisualizationCallback(L.Callback):
             preds = preds.transpose(1, 2).contiguous()
 
         num_samples = min(self.num_samples_plot, inputs.shape[0])
-        sensor_idx = np.random.randint(0, max(1, C))
 
-        fig, axes = plt.subplots(num_samples, 1, figsize=(10, 4 * num_samples), sharex=False)
-        if num_samples == 1:
+        if self.sample_indices is not None:
+            sample_indices = [int(i) for i in self.sample_indices if 0 <= int(i) < inputs.shape[0]]
+            sample_indices = sample_indices[:num_samples] if sample_indices else list(range(num_samples))
+        elif self.fixed_samples or self.sensor_indices is not None:
+            sample_indices = list(range(num_samples))
+        else:
+            sample_indices = np.random.choice(inputs.shape[0], size=num_samples, replace=False).tolist()
+
+        if self.sensor_indices is None:
+            sensor_indices = [int(np.random.randint(0, max(1, C)))]
+        else:
+            sensor_indices = [int(s) for s in self.sensor_indices if 0 <= int(s) < C]
+            if not sensor_indices:
+                return
+
+        total_plots = len(sample_indices) * len(sensor_indices)
+        fig, axes = plt.subplots(total_plots, 1, figsize=(10, 3.5 * total_plots), sharex=False)
+        if total_plots == 1:
             axes = [axes]
 
-        for i in range(num_samples):
-            ax = axes[i]
+        plot_idx = 0
+        for sample_idx in sample_indices:
+            for sensor_idx in sensor_indices:
+                ax = axes[plot_idx]
+                plot_idx += 1
 
-            # Create time axes
-            L_in = inputs.shape[-1]
-            L_out = 0
-            if targets is not None:
-                L_out = targets.shape[-1]
-            elif preds is not None:
-                L_out = preds.shape[-1]
+                # Create time axes
+                L_in = inputs.shape[-1]
+                L_out = 0
+                if targets is not None:
+                    L_out = targets.shape[-1]
+                elif preds is not None:
+                    L_out = preds.shape[-1]
 
-            t_in = range(0, L_in)
-            t_out = range(L_in, L_in + L_out)  # Target follows input
+                t_in = range(0, L_in)
+                t_out = range(L_in, L_in + L_out)  # Target follows input
 
-            # Data for sample i and chosen sensor
-            seq_in = inputs[i, sensor_idx, :].cpu().numpy()
-            seq_target = targets[i, sensor_idx, :].cpu().numpy() if targets is not None else None
-            seq_pred = preds[i, sensor_idx, :].cpu().numpy() if preds is not None else None
+                # Data for sample and chosen sensor
+                seq_in = inputs[sample_idx, sensor_idx, :].cpu().numpy()
+                seq_target = targets[sample_idx, sensor_idx, :].cpu().numpy() if targets is not None else None
+                seq_pred = preds[sample_idx, sensor_idx, :].cpu().numpy() if preds is not None else None
 
-            ax.plot(t_in, seq_in, label='Input History', color='gray', linestyle='--')
-            if seq_target is not None and len(seq_target) > 0:
-                ax.plot(t_out, seq_target, label='Ground Truth', color='green')
-            if seq_pred is not None and len(seq_pred) > 0:
-                ax.plot(t_out, seq_pred, label='Prediction', color='red')
+                ax.plot(t_in, seq_in, label='Input History', color='gray', linestyle='--')
+                if seq_target is not None and len(seq_target) > 0:
+                    ax.plot(t_out, seq_target, label='Ground Truth', color='green')
+                if seq_pred is not None and len(seq_pred) > 0:
+                    ax.plot(t_out, seq_pred, label='Prediction', color='red')
 
-            ax.set_title(f"Sample {i} - Sensor {sensor_idx}")
-            ax.legend(loc='upper left')
-            ax.grid(True, alpha=0.3)
+                ax.set_title(f"Sample {sample_idx} - Sensor {sensor_idx}")
+                ax.legend(loc='upper left')
+                ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
         # Log to Tensorboard (and save to disk)

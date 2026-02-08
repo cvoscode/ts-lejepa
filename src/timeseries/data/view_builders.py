@@ -13,22 +13,25 @@ class AugmentationViewBuilder:
     """Builds multiple augmented views from a window.
 
     View structure (with num_prev=2, repeat_factor=10):
-        [t-2, t-1, t0_clean, t0_aug1, t0_aug2, ..., t0_aug10]
+        [t-1_aug1, t-1_aug2, t0_clean, t0_aug1, t0_aug2, ..., t0_aug10]
         
-    Key improvements:
-        1. Previous views (t-1, t-2, ...) are kept UNAUGMENTED for clean temporal context
+    Key design:
+        1. Previous views are num_prev AUGMENTED copies of the t-1 window only.
+           This removes implicit time ordering (t-2, t-3, etc.) from the views,
+           reducing the risk of the encoder learning positional shortcuts instead
+           of temporal dynamics.
         2. First t0 view is CLEAN (unaugmented) for probe training
         3. Remaining t0 views are augmented for SSL invariance learning
         
     The probe should use index `num_prev` (the clean t0 view).
-    SSL invariance uses all views but benefits from clean prev + clean t0 anchors.
+    SSL invariance uses all views but benefits from clean t0 anchor.
     """
 
     transform: torch.nn.Module
     repeat_factor: int = 2  # Number of AUGMENTED t0 views
-    num_prev: int = 0  # Number of previous views to include (unaugmented)
+    num_prev: int = 0  # Number of augmented t-1 views to include
     include_clean_t0: bool = True  # Whether to include a clean t0 view for probe
-    prev_transform: Optional[torch.nn.Module] = None  # Deprecated, prev views now unaugmented
+    prev_transform: Optional[torch.nn.Module] = None  # Optional separate transform for prev views
 
     @property
     def clean_t0_index(self) -> int:
@@ -54,12 +57,14 @@ class AugmentationViewBuilder:
         prev_windows: Optional[list[torch.Tensor]] = None,
         prev_time_features: Optional[list[torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Generate t0 views and optional previous views (t-1, t-2, ...).
+        """Generate t0 views and optional augmented t-1 views.
 
         View order:
-            [t-N, ..., t-2, t-1, t0_clean, t0_aug1, ..., t0_augR]
+            [t-1_aug1, ..., t-1_augN, t0_clean, t0_aug1, ..., t0_augR]
             where N = num_prev, R = repeat_factor
             
+        Previous views are all augmented copies of the SAME t-1 window.
+        This avoids implicit time encoding from t-2, t-3, etc.
         The clean t0 view is at index `num_prev` for easy probe access.
 
         Returns:
@@ -72,26 +77,29 @@ class AugmentationViewBuilder:
         views_list = []
         view_times_list = []
 
-        # 1. Add previous views UNAUGMENTED (t-N, ..., t-2, t-1)
-        #    These provide clean temporal context for the model
+        # 1. Add num_prev AUGMENTED copies of the t-1 window
+        #    Only uses the most recent previous window (t-1) and creates
+        #    multiple augmented views of it, removing implicit time ordering.
         if self.num_prev > 0:
-            if prev_windows is None or len(prev_windows) < self.num_prev:
-                raise ValueError(f"num_prev={self.num_prev} requires {self.num_prev} prev_windows")
+            if prev_windows is None or len(prev_windows) < 1:
+                raise ValueError(f"num_prev={self.num_prev} requires at least 1 prev_window (t-1)")
             
-            # prev_windows list is ordered [t-1, t-2, ..., t-N]
-            # Reverse to emit chronological order [t-N, ..., t-2, t-1]
-            for i in reversed(range(self.num_prev)):
-                # Keep UNAUGMENTED - no transform applied
-                prev_view = prev_windows[i].clone().unsqueeze(0)  # [1, C, T]
-                views_list.append(prev_view)
+            # Use only the t-1 window (index 0 in prev_windows list)
+            t_minus_1 = prev_windows[0]
+            aug_transform = self.prev_transform if self.prev_transform is not None else self.transform
+            
+            for _ in range(self.num_prev):
+                prev_view = aug_transform(t_minus_1.clone().unsqueeze(0)).squeeze(0)  # [C, T]
+                views_list.append(prev_view.unsqueeze(0))  # [1, C, T]
                 
                 if time_features is not None:
-                    if prev_time_features is None or len(prev_time_features) < self.num_prev:
+                    if prev_time_features is None or len(prev_time_features) < 1:
                         raise ValueError(
-                            f"num_prev={self.num_prev} requires {self.num_prev} prev_time_features "
+                            "num_prev > 0 requires at least 1 prev_time_features "
                             "when time_features is provided"
                         )
-                    prev_times = prev_time_features[i].unsqueeze(0)
+                    # All t-1 augmented views share the same t-1 time features
+                    prev_times = prev_time_features[0].unsqueeze(0)
                     view_times_list.append(prev_times)
         
         # 2. Add CLEAN t0 view (unaugmented) for probe training
@@ -105,9 +113,14 @@ class AugmentationViewBuilder:
                 view_times_list.append(clean_t0_times)
         
         # 3. Add AUGMENTED t0 views for SSL invariance learning
+        #    Apply transforms individually per view to ensure each gets a unique
+        #    random augmentation (batch-applying would apply the same random choice
+        #    to all views, reducing view diversity).
         if self.repeat_factor > 0:
-            t0_batch = window.unsqueeze(0).repeat(self.repeat_factor, 1, 1).clone()  # [R, C, T]
-            t0_augmented = self.transform(t0_batch)  # Apply augmentations
+            t0_augmented = torch.stack([
+                self.transform(window.clone().unsqueeze(0)).squeeze(0)
+                for _ in range(self.repeat_factor)
+            ])  # [R, C, T]
             views_list.append(t0_augmented)
             
             if time_features is not None:

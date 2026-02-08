@@ -6,15 +6,16 @@ This module is encoder-agnostic and computes invariance and SIGReg losses
 from multi-view inputs.
 
 View Structure (with num_prev_views=2, repeat_factor=10):
-    [t-2, t-1, t0_clean, t0_aug1, t0_aug2, ..., t0_aug10]
+    [t-1_aug1, t-1_aug2, t0_clean, t0_aug1, t0_aug2, ..., t0_aug10]
     
-    - Indices 0 to num_prev_views-1: Previous windows (unaugmented)
+    - Indices 0 to num_prev_views-1: Augmented copies of t-1 window
     - Index num_prev_views: Clean t0 (unaugmented, used as anchor)
     - Indices num_prev_views+1 onwards: Augmented t0 views
     
 Key Improvements:
     1. Clean t0 anchor-based invariance
     2. Embedding diagnostics: Monitor std and collapse ratio
+    3. Previous views are augmented copies of t-1 only (no t-2, t-3, etc.)
 """
 
 from dataclasses import dataclass
@@ -47,8 +48,8 @@ class LeJEPA_SSL(nn.Module):
     Expects views shaped [B, V, C, T] (or [B, V, C, T, F]).
     
     View convention:
-        [t-N, ..., t-1, t0_clean, t0_aug1, ..., t0_augR]
-        - Indices 0..num_prev_views-1: Previous windows (unaugmented temporal context)
+        [t-1_aug1, ..., t-1_augN, t0_clean, t0_aug1, ..., t0_augR]
+        - Indices 0..num_prev_views-1: Augmented copies of t-1 window
         - Index num_prev_views: Clean t0 view (anchor for probe and SSL)
         - Indices num_prev_views+1..V: Augmented t0 views for invariance learning
         

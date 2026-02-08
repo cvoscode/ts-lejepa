@@ -2,14 +2,11 @@ import numpy as np
 from matplotlib import pyplot as plt
 import plotly.graph_objects as go
 import plotly.io as pio
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import torch
 
 from ..core.types import Batch
-
-if TYPE_CHECKING:
-    from ..data.pems import PeMS08DataModule
 
 pio.templates.default = "plotly_white"
 def visualize_pems_tuple(
@@ -27,9 +24,11 @@ def visualize_pems_tuple(
     show_t0_mean: bool = True,
     opacity_aug: float = 0.7,
     max_t0_views: Optional[int] = None,
-    align_prev_to_t0: bool = True,
+    align_prev_to_t0: bool = False,
     align_method: str = "xcorr",
     show: bool = True,
+    num_prev_views: Optional[int] = None,
+    include_clean_t0: Optional[bool] = None,
 ):
     """
     Visualize PeMS multi-view windows and the (optional) future target.
@@ -38,9 +37,9 @@ def visualize_pems_tuple(
     - Pass a datamodule (historical behavior): `visualize_pems_tuple(datamodule, stage=..., batch_index=..., ...)`
     - Pass a single batch directly (new): `visualize_pems_tuple(batch, batch_index=..., ...)`
 
-    Notes:
-    - The dataset can return a variable number of views V.
-      Convention is: view[0]=previous window, view[1:V-1]=repeated augmented current windows, view[V-1]=next window (if present).
+        Notes:
+        - The SSL datamodule returns past-only views:
+            [t-1_aug1..t-1_augN, t0_clean (optional), t0_aug1..t0_augR]
     - `sensor_index` is treated as 1-based if > 0 (legacy behavior), else 0-based.
 
     Args:
@@ -49,8 +48,8 @@ def visualize_pems_tuple(
         batch_index: Index of the sample within the batch (effectively sample index).
         sensor_index: 1-based if > 0 else 0-based.
         window_size/target_window_size/temporal_shift: Optional overrides when passing a batch directly.
-        show_prev: If True and V>=3, plot the previous window (t-1) as a dashed trace.
-        show_next: If True and V>=3, plot the next window (t+1). Defaults to False since many datasets are past-only.
+        show_prev: If True and prev views exist, plot each t-1 view as dashed traces.
+        show_next: Ignored for SSL past-only views (kept for backward compatibility).
         show_target: If True and targets exist, plot them after t0.
         show_t0_mean: Plot mean across t0 augmented views.
         opacity_aug: Opacity for individual t0 augmentation traces.
@@ -59,14 +58,6 @@ def visualize_pems_tuple(
     def _unpack_batch(batch):
         if isinstance(batch, Batch):
             return batch.views, batch.targets
-        if isinstance(batch, (tuple, list)):
-            # Handle both old (2-tuple) and new (4-tuple) batch formats
-            if len(batch) == 4:
-                views_b, target_b, _, _ = batch
-                return views_b, target_b
-            if len(batch) == 2:
-                views_b, target_b = batch
-                return views_b, target_b
         raise ValueError(f"Unsupported batch type: {type(batch)!r}")
 
     # If a datamodule-like object is passed, fetch one batch.
@@ -141,15 +132,30 @@ def visualize_pems_tuple(
     temporal_shift = int(temporal_shift)
 
     V = int(views_batch.shape[1])
-    if V < 2:
-        print(f"Error: Expected at least 2 views, got V={V}")
+    if V < 1:
+        print(f"Error: Expected at least 1 view, got V={V}")
         return
 
-    # If V>=3, we assume [t-1, t0..., t+1]. Otherwise, treat all as t0-like.
-    has_prev_next = V >= 3
-    has_prev = has_prev_next
-    has_next = has_prev_next
-    repeat_factor = V - 2 if has_prev_next else V
+    if num_prev_views is None and hasattr(batch_or_datamodule, "cfg"):
+        cfg_prev = getattr(batch_or_datamodule.cfg, "include_prev", 0)
+        if isinstance(cfg_prev, bool):
+            num_prev_views = 1 if cfg_prev else 0
+        else:
+            num_prev_views = int(cfg_prev)
+    if num_prev_views is None:
+        num_prev_views = 0
+
+    if include_clean_t0 is None and hasattr(batch_or_datamodule, "cfg"):
+        include_clean_t0 = bool(getattr(batch_or_datamodule.cfg, "include_clean_t0", True))
+    if include_clean_t0 is None:
+        include_clean_t0 = True
+
+    num_prev_views = max(0, int(num_prev_views))
+    clean_t0_index = num_prev_views if include_clean_t0 else 0
+    t0_aug_start = clean_t0_index + (1 if include_clean_t0 else 0)
+    has_prev = num_prev_views > 0
+    has_next = False
+    repeat_factor = max(0, V - t0_aug_start)
 
     sensor_idx = sensor_index - 1 if sensor_index > 0 else 0
     if sensor_idx < 0 or sensor_idx >= int(views_batch.shape[2]):
@@ -161,54 +167,43 @@ def visualize_pems_tuple(
 
     print(f"--- Visualization ({stage} data) ---")
     print(f"Window lengths: L_in={L_in}, Target={L_target}. | Temporal shift: {temporal_shift}")
-    print(f"Views: V={V} => repeat_factor={repeat_factor} (t0 repeated views)")
+    print(
+        f"Views: V={V} => prev={num_prev_views}, clean_t0={int(include_clean_t0)}, "
+        f"t0_aug={repeat_factor}"
+    )
     
     # 3. Visualization
     fig = go.Figure()
     
     # base_start in the dataset is temporal_shift.
-    # In the visualization, we can set t0 start to 0 for convenience.
-    # Then t-1 starts at -temporal_shift, and t+1 starts at +temporal_shift.
+    # For visualization, anchor t0 at 0 and place t-1 immediately before it.
     
     time_curr = np.arange(0, L_in)
     time_target = np.arange(L_in, L_in + L_target) if L_target > 0 else None
     if has_prev and show_prev:
-        time_prev = np.arange(-temporal_shift, -temporal_shift + L_in)
-    if has_prev and show_next:
-        time_next = np.arange(temporal_shift, temporal_shift + L_in) 
+        # Shift t-1 views by prev_shift relative to t0.
+        time_prev = time_curr - temporal_shift
 
     # target_batch shape: often [B, H, C] but sometimes [B, C, H]
-    v_prev = None
-    v_next = None
+    prev_series = None
     if has_prev and show_prev:
-        v_prev = views_batch[batch_index, 0, sensor_idx, :].cpu().numpy()
-    if has_prev and show_next:
-        v_next = views_batch[batch_index, -1, sensor_idx, :].cpu().numpy()
+        prev_views = views_batch[batch_index, :num_prev_views, sensor_idx, :]
+        prev_series = [prev_views[i].cpu().numpy() for i in range(prev_views.shape[0])]
     target = None
 
     # Optionally align the prev view to the mean of t0 views using cross-correlation
-    shift_info = None
-    if align_prev_to_t0 and has_prev_next and v_prev is not None and len(views_batch.shape) >= 4:
-        # Choose reference: mean of t0 views or first t0 view
-        t0_start = 1 if has_prev_next else 0
-        t0_end = V - 1 if has_prev_next else V
-        ref_indices = list(range(t0_start, t0_end))
+    ref_signal = None
+    if align_prev_to_t0 and has_prev and prev_series is not None and len(views_batch.shape) >= 4:
+        # Choose reference: mean of t0 augmented views, fallback to clean t0
+        ref_indices = list(range(t0_aug_start, V))
         if max_t0_views is not None:
             ref_indices = ref_indices[: int(max_t0_views)]
-        if len(ref_indices) > 0:
+        if not ref_indices and include_clean_t0:
+            ref_indices = [clean_t0_index]
+
+        if ref_indices:
             refs = [views_batch[batch_index, j, sensor_idx, :].cpu().numpy() for j in ref_indices]
             ref_signal = np.mean(np.stack(refs, axis=0), axis=0)
-
-            if align_method == "xcorr":
-                # Normalize and compute cross-correlation
-                a = ref_signal - ref_signal.mean()
-                b = v_prev - v_prev.mean()
-                corr = np.correlate(a, b, mode='full')
-                lag = corr.argmax() - (len(b) - 1)
-                # Shift prev signal by lag (i.e. adjust its x positions)
-                shift_info = int(lag)
-            else:
-                shift_info = 0
     if show_target and target_batch is not None and isinstance(target_batch, torch.Tensor) and L_target > 0:
         target_sample = target_batch[batch_index]
         if target_sample.ndim == 2:
@@ -224,39 +219,54 @@ def visualize_pems_tuple(
                 "Skipping target plot."
             )
 
-    if v_prev is not None and has_prev and show_prev:
-        # Apply computed shift (if any) to the plotting x axis
-        if shift_info is not None and shift_info != 0:
-            shifted_time_prev = time_prev + shift_info
-            ann = f"aligned (lag={shift_info})"
-        else:
-            shifted_time_prev = time_prev
-            ann = None
+    if prev_series is not None and has_prev and show_prev:
+        for i, v_prev in enumerate(prev_series, start=1):
+            if align_prev_to_t0 and ref_signal is not None and align_method == "xcorr":
+                a = ref_signal - ref_signal.mean()
+                b = v_prev - v_prev.mean()
+                corr = np.correlate(a, b, mode='full')
+                lag = corr.argmax() - (len(b) - 1)
+                v_prev = np.roll(v_prev, int(lag))
+                ann = f"aligned (lag={int(lag)})"
+            else:
+                shifted_time_prev = time_prev
+                ann = None
 
+            fig.add_trace(
+                go.Scatter(
+                    x=time_prev,
+                    y=v_prev,
+                    name=f'T-1 aug {i}/{len(prev_series)}',
+                    line=dict(color='blue', width=2, dash='dash'),
+                    opacity=0.5,
+                    hovertemplate=("t=%{x}<br>y=%{y}<extra>t-1</extra>"),
+                )
+            )
+            if ann is not None:
+                fig.add_annotation(
+                    x=time_prev.mean(),
+                    y=v_prev.max(),
+                    text=ann,
+                    showarrow=False,
+                    yanchor='bottom',
+                )
+
+    # Plot t0 views (clean + augmented), plus their mean.
+    curr_views = []
+
+    if include_clean_t0 and clean_t0_index < V:
+        v_clean = views_batch[batch_index, clean_t0_index, sensor_idx, :].cpu().numpy()
         fig.add_trace(
             go.Scatter(
-                x=shifted_time_prev,
-                y=v_prev,
-                name='Previous window (t-1)',
-                line=dict(color='blue', width=2, dash='dash'),
-                opacity=0.5,
-                hovertemplate=("t=%{x}<br>y=%{y}<extra>t-1</extra>"),
+                x=time_curr,
+                y=v_clean,
+                name='T0 clean',
+                line=dict(color='rgba(0, 128, 0, 0.8)', width=2),
+                opacity=0.9,
             )
         )
-        if ann is not None:
-            fig.add_annotation(x=shifted_time_prev.mean(), y=v_prev.max(), text=ann, showarrow=False, yanchor='bottom')
 
-    # Plot each repeated augmented t0 view, plus their mean.
-    # Plot augmented t0 views
-    curr_views = []
-    if has_prev_next:
-        t0_start = 1
-        t0_end = V - 1
-    else:
-        t0_start = 0
-        t0_end = V
-
-    t0_indices = list(range(t0_start, t0_end))
+    t0_indices = list(range(t0_aug_start, V))
     if max_t0_views is not None:
         t0_indices = t0_indices[: int(max_t0_views)]
 
@@ -280,19 +290,8 @@ def visualize_pems_tuple(
                 x=time_curr,
                 y=v_curr_mean,
                 name='T0 mean (over repeats)',
-                line=dict(color='green', width=3),
+                line=dict(color='green', width=3, dash='dot'),
                 opacity=0.9,
-            )
-        )
-
-    if v_next is not None and has_prev and show_next:
-        fig.add_trace(
-            go.Scatter(
-                x=time_next,
-                y=v_next,
-                name='Next window (t+1)',
-                line=dict(color='red', width=2, dash='dash'),
-                opacity=0.5,
             )
         )
     

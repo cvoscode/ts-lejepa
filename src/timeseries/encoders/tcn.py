@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from ..core.base_encoder import BaseEncoder
-from .layers import ChannelMixer
+from ..preprocessing.time_encoding import NUM_TIME_FEATURES
+from .layers import ChannelMixer, TimeFeatureProjector
 
 
 class ResidualBlock1d(nn.Module):
@@ -87,6 +88,7 @@ class TCNEncoder(BaseEncoder):
         channel_mixer_attn_dim: int = 64,
         channel_mixer_attn_heads: int = 4,
         channel_mixer_attn_dropout: float = 0.0,
+        num_time_features: int = NUM_TIME_FEATURES,
     ):
         super().__init__(input_channels, output_dim, pool_mode)
         
@@ -100,6 +102,12 @@ class TCNEncoder(BaseEncoder):
             attn_dim=channel_mixer_attn_dim,
             attn_heads=channel_mixer_attn_heads,
             attn_dropout=channel_mixer_attn_dropout,
+        )
+
+        self.time_feature_proj = (
+            TimeFeatureProjector(int(num_time_features), input_channels)
+            if int(num_time_features) > 0
+            else None
         )
         
         # Stem
@@ -146,6 +154,7 @@ class TCNEncoder(BaseEncoder):
         """
         # x: [B, C, L]
         x = self.channel_mixer(x)
+        x = self._apply_time_features(x, time_features)
         x = self.stem(x)      # [B, hidden_channels, L]
         x = self.backbone(x)  # [B, hidden_channels*2^num_layers, L]
         
@@ -154,3 +163,11 @@ class TCNEncoder(BaseEncoder):
         emb = self.encoder_head(x)  # [B, L, D]
         
         return emb
+
+    def _apply_time_features(
+        self, x: torch.Tensor, time_features: torch.Tensor | None
+    ) -> torch.Tensor:
+        if time_features is None or self.time_feature_proj is None:
+            return x
+        time_emb = self.time_feature_proj(time_features).transpose(1, 2)
+        return x + time_emb

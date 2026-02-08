@@ -6,7 +6,8 @@ import torch.nn.init as init
 from torch_geometric_temporal.nn.recurrent import GConvLSTM
 
 from ..core.base_encoder import BaseEncoder
-from .layers import ChannelMixer
+from ..preprocessing.time_encoding import NUM_TIME_FEATURES
+from .layers import ChannelMixer, TimeFeatureProjector
 
 # ============================================================
 # Graph-LSTM encoder using BaseEncoder pattern
@@ -39,7 +40,8 @@ class GraphLSTMEncoder(BaseEncoder):
                  channel_mixer_reduction: int = 4,
                  channel_mixer_attn_dim: int = 64,
                  channel_mixer_attn_heads: int = 4,
-                 channel_mixer_attn_dropout: float = 0.0):
+                 channel_mixer_attn_dropout: float = 0.0,
+                 num_time_features: int = NUM_TIME_FEATURES):
         super().__init__(input_channels, output_dim, pool_mode)
 
         self.gnn_hidden_channels = gnn_hidden_channels
@@ -52,6 +54,12 @@ class GraphLSTMEncoder(BaseEncoder):
             attn_dim=channel_mixer_attn_dim,
             attn_heads=channel_mixer_attn_heads,
             attn_dropout=channel_mixer_attn_dropout,
+        )
+
+        self.time_feature_proj = (
+            TimeFeatureProjector(int(num_time_features), input_channels)
+            if int(num_time_features) > 0
+            else None
         )
 
         # Store graph structure on the module
@@ -111,6 +119,7 @@ class GraphLSTMEncoder(BaseEncoder):
 
         # x: [B, C, T]
         x = self.channel_mixer(x)
+        x = self._apply_time_features(x, time_features)
         B, C, T = x.shape
         
         # Reformat to [B, T, C, 1] for graph processing
@@ -142,4 +151,12 @@ class GraphLSTMEncoder(BaseEncoder):
         emb = self.encoder_head(output)  # [B, T, D]
         
         return emb
+
+    def _apply_time_features(
+        self, x: torch.Tensor, time_features: torch.Tensor | None
+    ) -> torch.Tensor:
+        if time_features is None or self.time_feature_proj is None:
+            return x
+        time_emb = self.time_feature_proj(time_features).transpose(1, 2)
+        return x + time_emb
 

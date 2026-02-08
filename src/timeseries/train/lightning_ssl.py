@@ -37,6 +37,10 @@ class SSLPretrainModule(L.LightningModule):
         probe_start_epoch: int = 0,
         probe_start_step: int = 0,
         clean_t0_index: Optional[int] = None,  # Index of clean t0 view for probe
+        # LR schedule params
+        scheduler: str = "cosine",  # 'cosine' or 'none'
+        warmup_epochs: int = 5,
+        min_lr: float = 1e-6,
     ) -> None:
         super().__init__()
         self.ssl_core = ssl_core
@@ -50,6 +54,12 @@ class SSLPretrainModule(L.LightningModule):
         self.probe_start_step = int(probe_start_step)
         # Default: clean t0 is at index num_prev_views (first t0 after prev views)
         self._clean_t0_index = clean_t0_index if clean_t0_index is not None else ssl_core.num_prev_views
+        # LR schedule
+        self.scheduler_type = str(scheduler)
+        self.warmup_epochs = int(warmup_epochs)
+        self.min_lr = float(min_lr)
+
+        torch.set_float32_matmul_precision('medium')
 
     def _probe_is_active(self) -> bool:
         if self.probe is None:
@@ -126,9 +136,12 @@ class SSLPretrainModule(L.LightningModule):
         views = batch.views
         # Use clean t0 view (unaugmented) for probe evaluation
         clean_t0_view = views[:, self._clean_t0_index, ...]
+        clean_t0_times = None
+        if batch.view_times is not None:
+            clean_t0_times = batch.view_times[:, self._clean_t0_index, ...]
         
         with torch.no_grad():
-            emb = self._encode_probe_features(clean_t0_view)
+            emb = self._encode_probe_features(clean_t0_view, clean_t0_times)
         
         if not self._probe_is_active():
             return
@@ -156,9 +169,12 @@ class SSLPretrainModule(L.LightningModule):
         views = batch.views
         # Use clean t0 view (unaugmented) at the known index
         clean_t0_view = views[:, self._clean_t0_index, ...]
+        clean_t0_times = None
+        if batch.view_times is not None:
+            clean_t0_times = batch.view_times[:, self._clean_t0_index, ...]
         
         with torch.no_grad():
-            emb = self._encode_probe_features(clean_t0_view)
+            emb = self._encode_probe_features(clean_t0_view, clean_t0_times)
 
         preds = self.probe(emb, batch.future_times)
         targets = batch.targets
@@ -169,12 +185,25 @@ class SSLPretrainModule(L.LightningModule):
         
         return F.mse_loss(preds, targets)
 
-    def _encode_probe_features(self, clean_t0_view: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
+    def _encode_probe_features(
+        self,
+        clean_t0_view: torch.Tensor,
+        clean_t0_times: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
         encoder = self.ssl_core.encoder
         if hasattr(encoder, "forward_multilevel"):
-            emb = encoder.forward_multilevel(clean_t0_view)
+            try:
+                emb = encoder.forward_multilevel(clean_t0_view, clean_t0_times)
+            except TypeError:
+                emb = encoder.forward_multilevel(clean_t0_view)
         else:
-            emb = encoder(clean_t0_view)
+            if clean_t0_times is not None:
+                try:
+                    emb = encoder(clean_t0_view, clean_t0_times)
+                except TypeError:
+                    emb = encoder(clean_t0_view)
+            else:
+                emb = encoder(clean_t0_view)
 
         if isinstance(emb, (list, tuple)):
             processed: list[torch.Tensor] = []
@@ -189,7 +218,7 @@ class SSLPretrainModule(L.LightningModule):
         return emb
 
     def configure_optimizers(self):
-        """AdamW optimizer for SSL core and optional probe head."""
+        """AdamW optimizer with optional cosine LR schedule + linear warmup."""
         params = [{"params": self.ssl_core.parameters(), "lr": self.lr, "weight_decay": self.weight_decay}]
         if self.probe is not None:
             params.append(
@@ -201,7 +230,46 @@ class SSLPretrainModule(L.LightningModule):
                     ),
                 }
             )
-        return torch.optim.AdamW(params)
+        optimizer = torch.optim.AdamW(params)
+
+        if self.scheduler_type == "none":
+            return optimizer
+
+        # Cosine annealing with linear warmup
+        max_epochs = self.trainer.max_epochs if self.trainer and self.trainer.max_epochs else 100
+        warmup_epochs = min(self.warmup_epochs, max_epochs)
+
+        remaining_epochs = max_epochs - warmup_epochs
+        if remaining_epochs <= 0:
+            if warmup_epochs > 0:
+                scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, total_iters=warmup_epochs
+                )
+            else:
+                return optimizer
+        else:
+            cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining_epochs, eta_min=self.min_lr
+            )
+
+            if warmup_epochs > 0:
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=0.01, total_iters=warmup_epochs
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs]
+                )
+            else:
+                scheduler = cosine_scheduler
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
 
 __all__ = ["SSLPretrainModule"]

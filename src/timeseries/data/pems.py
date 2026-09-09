@@ -12,13 +12,12 @@ from omegaconf import DictConfig
 from ..transforms.base import Transform
 from ..transforms.compose import Compose, RandomApply, OneOf
 from ..transforms.ops import (
-    Scaling,
-    Drift,
-    FeatureJitter,
     AddGaussianNoise,
+    Bias,
+    FeatureJitter,
     FrequencyMask,
     MagnitudeWarp,
-    TemporalCrop,
+    Scaling,
     TemporalBlockMask,
 )
 from .probe_dataset import ForecastProbeDataset
@@ -52,8 +51,11 @@ def build_ssl_transform(
     p_transform: float = 0.0,
     augmentation_mode: str = "compound",
     p_per_aug: float = 0.4,
+    bias_std: float = 0.0,
 ) -> Transform:
     """Build a configurable SSL augmentation pipeline using the new transform stack.
+
+    All augmentations are backed by the ``augmenttime`` package.
 
     Args:
         augmentation_mode: 'compound' (default) applies each augmentation independently
@@ -61,9 +63,16 @@ def build_ssl_transform(
             'oneof' (legacy) selects at most one augmentation per view.
         p_per_aug: Per-augmentation probability in compound mode (default 0.4).
         p_transform: Overall probability of applying the OneOf block in legacy mode.
+        bias_std: Std of the per-channel bias augmentation (replaces the legacy
+            Drift op). Off by default; set >0 to enable.
+        output_length, crop_ratio_range, p_temporal_crop: Kept for config
+            backwards compatibility; ignored since augmenttime does not provide
+            a temporal crop primitive.
     """
-    ops = [Scaling(scale_range=scale_range), Drift()]
+    ops = [Scaling(scale_range=scale_range)]
 
+    if bias_std and bias_std > 0:
+        ops.append(Bias(bias_std=bias_std))
     if jitter_std and jitter_std > 0:
         ops.append(FeatureJitter(jitter_std=jitter_std))
     if p_noise and p_noise > 0:
@@ -85,14 +94,6 @@ def build_ssl_transform(
         # Legacy 'oneof' mode: selects at most one augmentation per view
         if ops and p_transform and p_transform > 0:
             pipeline.append(RandomApply(OneOf(ops), p=p_transform))
-
-    if p_temporal_crop and p_temporal_crop > 0:
-        pipeline.append(
-            RandomApply(
-                TemporalCrop(output_length=output_length, crop_ratio_range=crop_ratio_range),
-                p=p_temporal_crop,
-            )
-        )
 
     if p_temporal_mask and p_temporal_mask > 0:
         pipeline.append(TemporalBlockMask(p=p_temporal_mask))
@@ -125,9 +126,8 @@ class PeMS08:
     num_sensors = 170
     url = 'https://drive.switch.ch/index.php/s/X0nkiDgb8oacOD0/download'
 
-    def __init__(self, root: str = "./data/pems08", mask_zeros: bool = True, similarity: str = "distance", threshold: float | None = None):
+    def __init__(self, root: str = "./data/pems08", similarity: str = "distance", threshold: float | None = None):
         self.root = root
-        self.mask_zeros = mask_zeros
         self.similarity = similarity
         self.threshold = threshold
         self.target = None
@@ -215,7 +215,7 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         )
 
     def prepare_data(self):
-        PeMS08(root="./data/pems08", mask_zeros=True)
+        PeMS08(root="./data/pems08")
 
     def _make_view_dataset(self, data: torch.Tensor, time_features: torch.Tensor, *, repeat_factor: int) -> ViewDataset:
         # Handle include_prev as bool or int
@@ -254,7 +254,7 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         return ViewDataset(window_ds, view_builder)
 
     def setup(self, stage=None):
-        pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
+        pems08 = PeMS08(root="./data/pems08")
         data = torch.tensor(pems08.target.values, dtype=torch.float32)  # [T, C]
 
         time_features = encode_timestamps_torch(pems08.timestamps)  # [T, 6]
@@ -276,7 +276,10 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         repeat_factor_val = int(getattr(self.cfg, "repeat_factor_val", repeat_factor_train))
 
         if split_mode == "random_windows":
-            full_scaled_3d = self.scaler.fit_transform(data)
+            # Fix: fit scaler on train-portion timesteps only to prevent leakage
+            n_scaler = int(len(data) * split_frac)
+            self.scaler.fit(data[:n_scaler])
+            full_scaled_3d = self.scaler.transform(data)
             full_scaled_ct = full_scaled_3d.squeeze(0)  # [C, T]
 
             base_train = self._make_view_dataset(full_scaled_ct, time_features, repeat_factor=repeat_factor_train)
@@ -287,7 +290,35 @@ class PeMS08SSLDataModule(L.LightningDataModule):
             g = torch.Generator().manual_seed(split_seed)
             perm = torch.randperm(n_windows, generator=g).tolist()
             train_idx = perm[:n_train]
-            val_idx = perm[n_train:]
+            val_idx_candidates = perm[n_train:]
+
+            # Fix: purge val windows that overlap with any train window
+            # Window i starts at offset (prev_shift * num_prev) + i * stride
+            stride = int(getattr(self.cfg, "stride", 1))
+            window_size = int(self.cfg.window_size)
+            prev_shift = int(getattr(self.cfg, "prev_shift", getattr(self.cfg, "temporal_shift", 10)))
+            num_prev = min(1, int(getattr(self.cfg, "include_prev", 0)) if not isinstance(getattr(self.cfg, "include_prev", 0), bool) else (1 if getattr(self.cfg, "include_prev", 0) else 0))
+            base_offset = prev_shift * num_prev
+
+            train_starts = {base_offset + i * stride for i in train_idx}
+            val_idx = []
+            for vi in val_idx_candidates:
+                vs = base_offset + vi * stride
+                # Check if any train window start is within window_size of this val start
+                if all(abs(vs - ts) >= window_size for ts in train_starts):
+                    val_idx.append(vi)
+
+            if not val_idx:
+                import warnings
+                warnings.warn(
+                    f"random_windows: all val windows overlap with train windows "
+                    f"(stride={stride}, window_size={window_size}). "
+                    f"Consider using split_mode='temporal' or increasing stride.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                val_idx = val_idx_candidates  # fall back to allow training to proceed
+
             self.train_ds = Subset(base_train, train_idx)
             self.val_ds = Subset(base_val, val_idx)
             return
@@ -295,7 +326,7 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         if split_mode == "ts_cv":
             n_splits = int(getattr(self.cfg, "cv_folds", 5))
             fold = int(getattr(self.cfg, "cv_fold", 0))
-            gap = int(getattr(self.cfg, "cv_gap", 0))
+            gap = int(getattr(self.cfg, "cv_gap", self.cfg.window_size))
 
             if n_splits < 2:
                 raise ValueError(f"cfg.cv_folds must be >= 2, got {n_splits}")
@@ -371,10 +402,10 @@ class PeMS08ProbeDataModule(L.LightningDataModule):
         self.scaler = TorchStandardScaler()
 
     def prepare_data(self):
-        PeMS08(root="./data/pems08", mask_zeros=True)
+        PeMS08(root="./data/pems08")
 
     def setup(self, stage=None):
-        pems08 = PeMS08(root="./data/pems08", mask_zeros=True)
+        pems08 = PeMS08(root="./data/pems08")
         data = torch.tensor(pems08.target.values, dtype=torch.float32)  # [T, C]
         time_features = encode_timestamps_torch(pems08.timestamps)  # [T, 6]
 

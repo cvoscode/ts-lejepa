@@ -220,7 +220,7 @@ class SSLPretrainModule(L.LightningModule):
     def configure_optimizers(self):
         """AdamW optimizer with optional cosine LR schedule + linear warmup."""
         params = [{"params": self.ssl_core.parameters(), "lr": self.lr, "weight_decay": self.weight_decay}]
-        if self.probe is not None:
+        if self.probe is not None and self.probe_loss_weight > 0:
             params.append(
                 {
                     "params": self.probe.parameters(),

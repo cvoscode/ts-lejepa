@@ -3,7 +3,9 @@ import torch
 import lightning as L
 import matplotlib.pyplot as plt
 import numpy as np
-import umap
+import logging
+
+import pacmap
 from torch.utils.data import DataLoader, Subset
 
 from ..core.types import Batch
@@ -12,8 +14,8 @@ class VisualizationCallback(L.Callback):
     def __init__(
         self,
         num_samples_plot=3,
-        umap_every_n_epochs=1,
-        num_umap_batches=10,
+        pacmap_every_n_epochs=1,
+        num_pacmap_batches=10,
         sensor_indices=None,
         sample_indices=None,
         fixed_samples=False,
@@ -23,8 +25,8 @@ class VisualizationCallback(L.Callback):
         """
         Args:
             num_samples_plot: Number of samples (time series) to plot.
-            umap_every_n_epochs: UMAP is expensive, so only run it every N epochs.
-            num_umap_batches: How many batches to collect for UMAP (more = more accurate, but slower).
+            pacmap_every_n_epochs: PaCMAP is expensive, so only run it every N epochs.
+            num_pacmap_batches: How many batches to collect for PaCMAP (more = more accurate, but slower).
             sensor_indices: Optional list of sensor indices to plot (fixed order).
             sample_indices: Optional list of batch sample indices to plot (fixed order).
             fixed_samples: If True, use the first N samples each time instead of random.
@@ -33,8 +35,8 @@ class VisualizationCallback(L.Callback):
         """
         super().__init__()
         self.num_samples_plot = num_samples_plot
-        self.umap_every_n_epochs = umap_every_n_epochs
-        self.num_umap_batches = num_umap_batches
+        self.pacmap_every_n_epochs = pacmap_every_n_epochs
+        self.num_pacmap_batches = num_pacmap_batches
         self.sensor_indices = sensor_indices
         self.sample_indices = sample_indices
         self.fixed_samples = fixed_samples
@@ -259,8 +261,8 @@ class VisualizationCallback(L.Callback):
         
         val_loader = trainer.datamodule.val_dataloader()
         fixed_batch = self._get_fixed_batch(val_loader, "val")
-        
-        # Containers for UMAP
+
+        # Containers for PaCMAP
         all_embeddings = []
         all_times = [] # Time index for coloring
         
@@ -278,7 +280,7 @@ class VisualizationCallback(L.Callback):
                 if fixed_batch is not None:
                     plot_data = self._plot_data_from_batch(fixed_batch, trainer, pl_module)
                 for i, batch in enumerate(val_loader):
-                    if i >= self.num_umap_batches:
+                    if i >= self.num_pacmap_batches:
                         break
                 
                     # Batch extraction: handle Batch dataclass and legacy tuple formats
@@ -309,7 +311,7 @@ class VisualizationCallback(L.Callback):
                     else:
                         emb_all = self._backbone_forward(pl_module, vs_flat)
                     
-                    # Get t0 embeddings for UMAP and forecasting (derive shapes from emb_all)
+                    # Get t0 embeddings for PaCMAP and forecasting (derive shapes from emb_all)
                     if emb_all.dim() == 3:
                         BV, T, D = emb_all.shape
                         emb_views = emb_all.view(B, V, T, D)
@@ -329,7 +331,7 @@ class VisualizationCallback(L.Callback):
 
                     yhat = self._forecast_from_module(pl_module, forecast_input, future_times)
                     
-                    # Collect embeddings for UMAP
+                    # Collect embeddings for PaCMAP
                     all_embeddings.append(emb_flat.cpu().numpy())
                     
                     # Real time indices (robust to shuffling)
@@ -355,12 +357,12 @@ class VisualizationCallback(L.Callback):
                 import traceback
                 traceback.print_exc()
 
-        # --- B. Plot UMAP (every N epochs) ---
-        if (trainer.current_epoch + 1) % self.umap_every_n_epochs == 0 and len(all_embeddings) > 0:
+        # --- B. Plot PaCMAP (every N epochs) ---
+        if (trainer.current_epoch + 1) % self.pacmap_every_n_epochs == 0 and len(all_embeddings) > 0:
             try:
                 embeddings_concat = np.concatenate(all_embeddings, axis=0)
                 times_concat = np.concatenate(all_times, axis=0)
-                self._plot_umap(trainer, embeddings_concat, times_concat, step='Validation')
+                self._plot_pacmap(trainer, embeddings_concat, times_concat, step='Validation')
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -374,8 +376,8 @@ class VisualizationCallback(L.Callback):
         fixed_batch = self._get_fixed_batch(train_loader, "train")
         # Ensure optional attrs exist to avoid AttributeError when inspecting targets
         self._ensure_pl_module_attrs(pl_module)
-        
-        # Containers for UMAP
+
+        # Containers for PaCMAP
         all_embeddings = []
         all_times = [] # Time index for coloring
 
@@ -391,7 +393,7 @@ class VisualizationCallback(L.Callback):
                 if fixed_batch is not None:
                     plot_data = self._plot_data_from_batch(fixed_batch, trainer, pl_module)
                 for i, batch in enumerate(train_loader):
-                    if i >= self.num_umap_batches:
+                    if i >= self.num_pacmap_batches:
                         break
                 
                     # Batch extraction: handle Batch dataclass and legacy tuple formats
@@ -422,7 +424,7 @@ class VisualizationCallback(L.Callback):
                     else:
                         emb_all = self._backbone_forward(pl_module, vs_flat)
                     
-                    # Get t0 embeddings for UMAP and forecasting (derive shapes from emb_all)
+                    # Get t0 embeddings for PaCMAP and forecasting (derive shapes from emb_all)
                     if emb_all.dim() == 3:
                         BV, T, D = emb_all.shape
                         emb_views = emb_all.view(B, V, T, D)
@@ -442,7 +444,7 @@ class VisualizationCallback(L.Callback):
 
                     yhat = self._forecast_from_module(pl_module, forecast_input, future_times)
                     
-                    # Collect embeddings for UMAP
+                    # Collect embeddings for PaCMAP
                     all_embeddings.append(emb_flat.cpu().numpy())
                     
                     # Real time indices (robust to shuffling)
@@ -467,11 +469,11 @@ class VisualizationCallback(L.Callback):
                
             
 
-        # --- B. Plot UMAP (every N epochs) ---
-        if (trainer.current_epoch + 1) % self.umap_every_n_epochs == 0 and len(all_embeddings) > 0:
+        # --- B. Plot PaCMAP (every N epochs) ---
+        if (trainer.current_epoch + 1) % self.pacmap_every_n_epochs == 0 and len(all_embeddings) > 0:
             embeddings_concat = np.concatenate(all_embeddings, axis=0)
             times_concat = np.concatenate(all_times, axis=0)
-            self._plot_umap(trainer, embeddings_concat, times_concat,step='Train')
+            self._plot_pacmap(trainer, embeddings_concat, times_concat,step='Train')
                 
            
 
@@ -562,31 +564,46 @@ class VisualizationCallback(L.Callback):
         self._log_figure(trainer, f"{step}/Predictions", fig)
         plt.close(fig)
 
-    def _plot_umap(self, trainer, embeddings, time_indices,step):
-        """ Computes and plots UMAP """
+    def _plot_pacmap(self, trainer, embeddings, time_indices,step):
+        """ Computes and plots PaCMAP """
         try:
             # Flatten embeddings if necessary
             if embeddings.ndim > 2:
                 embeddings = embeddings.reshape(embeddings.shape[0], -1)
-                
-            reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine')
-            embedding_2d = reducer.fit_transform(embeddings)
-            
+
+            reducer = pacmap.PaCMAP(
+                n_components=2,
+                n_neighbors=10,
+                MN_ratio=0.5,
+                FP_ratio=2.0,
+                apply_pca=True,
+                random_state=42,
+                verbose=False,
+            )
+            # Silence PaCMAP's "random state is set to ..." info-style warning
+            pacmap_logger = logging.getLogger("pacmap.pacmap")
+            prev_level = pacmap_logger.level
+            pacmap_logger.setLevel(logging.CRITICAL)
+            try:
+                embedding_2d = reducer.fit_transform(embeddings, init="pca")
+            finally:
+                pacmap_logger.setLevel(prev_level)
+
             fig, ax = plt.subplots(figsize=(10, 8))
             scatter = ax.scatter(
-                embedding_2d[:, 0], 
-                embedding_2d[:, 1], 
-                c=time_indices, 
-                cmap='viridis', 
-                s=10, 
+                embedding_2d[:, 0],
+                embedding_2d[:, 1],
+                c=time_indices,
+                cmap='viridis',
+                s=10,
                 alpha=0.6
             )
-            ax.set_title("UMAP of Embeddings (Color = Time Index)")
+            ax.set_title("PaCMAP of Embeddings (Color = Time Index)")
             plt.colorbar(scatter, label=f'Time Index within {step} Subset')
             ax.grid(True, alpha=0.3)
-            
-            self._log_figure(trainer, f"{step}/UMAP_Embedding", fig)
+
+            self._log_figure(trainer, f"{step}/PaCMAP_Embedding", fig)
             plt.close(fig)
-            
+
         except Exception as e:
-            print(f"UMAP visualization failed: {e}")
+            print(f"PaCMAP visualization failed: {e}")

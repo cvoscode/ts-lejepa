@@ -16,15 +16,14 @@ from ..data.view_dataset import ViewDataset, collate_batches
 from ..data.view_builders import AugmentationViewBuilder
 from ..transforms.base import Transform
 from ..transforms.compose import Compose, RandomApply
-from ..transforms.ops.basic import (
-    Scaling,
-    Drift,
-    FeatureJitter,
+from ..transforms.ops import (
     AddGaussianNoise,
+    Bias,
+    FeatureJitter,
     FrequencyMask,
     MagnitudeWarp,
+    Scaling,
     TemporalBlockMask,
-    TemporalCrop,
 )
 from ..preprocessing.scalers import TorchStandardScaler
 from ..preprocessing.time_encoding import encode_timestamps_torch
@@ -101,16 +100,21 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
         self.transform = self._build_transform()
 
     def _build_transform(self) -> Transform:
-        """Build SSL augmentation pipeline from config."""
+        """Build SSL augmentation pipeline from config.
+
+        All augmentations are backed by the ``augmenttime`` package.
+        """
         cfg = self.cfg
-        window_size = int(cfg.get("window_size", 96))
         mode = str(cfg.get("augmentation_mode", "compound"))
         p_per_aug = float(cfg.get("p_per_aug", 0.4))
 
         ops: list[Transform] = [
             Scaling(scale_range=tuple(cfg.get("scale_range", (0.9, 1.1)))),
-            Drift(),
         ]
+
+        bias_std = float(cfg.get("bias_std", 0.0))
+        if bias_std > 0:
+            ops.append(Bias(bias_std=bias_std))
 
         jitter_std = float(cfg.get("jitter_std", 0.05))
         if jitter_std > 0:
@@ -137,11 +141,6 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
             p_transform = float(cfg.get("p_transform", 0.7))
             if ops and p_transform > 0:
                 pipeline.append(RandomApply(OneOf(ops), p=p_transform))
-
-        p_temporal_crop = float(cfg.get("p_temporal_crop", 0.0))
-        if p_temporal_crop > 0:
-            crop_ratio_range = tuple(cfg.get("crop_ratio_range", (0.8, 1.0)))
-            pipeline.append(RandomApply(TemporalCrop(output_length=window_size, crop_ratio_range=crop_ratio_range), p=p_temporal_crop))
 
         p_temporal_mask = float(cfg.get("p_temporal_mask", 0.3))
         if p_temporal_mask > 0:
@@ -254,9 +253,11 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
         C, T = data_ct.shape
 
         if split_mode == "random_windows":
-            # Fit scaler on all data (random split)
-            # scaler expects [T, C]
-            full_scaled_3d = self.scaler.fit_transform(data_ct.t())
+            # Fix: fit scaler on train-portion timesteps only to prevent leakage
+            # data_ct is [C, T], scaler expects [T, C]
+            n_scaler = int(T * split_frac)
+            self.scaler.fit(data_ct[:, :n_scaler].t())
+            full_scaled_3d = self.scaler.transform(data_ct.t())
             full_scaled_ct = full_scaled_3d.squeeze(0)  # [C, T]
 
             base_train = self._make_view_dataset(full_scaled_ct, time_features, repeat_factor=repeat_factor_train)
@@ -266,9 +267,40 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
             n_train = int(n_windows * split_frac)
             g = torch.Generator().manual_seed(split_seed)
             perm = torch.randperm(n_windows, generator=g).tolist()
+            train_idx = perm[:n_train]
+            val_idx_candidates = perm[n_train:]
 
-            self.train_ds = Subset(base_train, perm[:n_train])
-            self.val_ds = Subset(base_val, perm[n_train:])
+            # Fix: purge val windows that overlap with any train window
+            stride = int(cfg.get("stride", 1))
+            window_size = int(cfg.get("window_size", 96))
+            prev_shift = int(cfg.get("prev_shift", cfg.get("temporal_shift", 10)))
+            include_prev_raw = cfg.get("include_prev", 0)
+            if isinstance(include_prev_raw, bool):
+                num_prev = 1 if include_prev_raw else 0
+            else:
+                num_prev = min(1, int(include_prev_raw))
+            base_offset = prev_shift * num_prev
+
+            train_starts = {base_offset + i * stride for i in train_idx}
+            val_idx = []
+            for vi in val_idx_candidates:
+                vs = base_offset + vi * stride
+                if all(abs(vs - ts) >= window_size for ts in train_starts):
+                    val_idx.append(vi)
+
+            if not val_idx:
+                import warnings
+                warnings.warn(
+                    f"random_windows: all val windows overlap with train windows "
+                    f"(stride={stride}, window_size={window_size}). "
+                    f"Consider using split_mode='temporal' or increasing stride.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                val_idx = val_idx_candidates
+
+            self.train_ds = Subset(base_train, train_idx)
+            self.val_ds = Subset(base_val, val_idx)
             return
 
         # Temporal split (default)

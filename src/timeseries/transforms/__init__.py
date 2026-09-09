@@ -1,18 +1,20 @@
 """Public exports for transform utilities."""
 
-from .base import Transform
-from .compose import Compose, RandomApply, OneOf
-from .registry import build_from_config
-from .ops import (
+from .augmenttime_ops import (
     AddGaussianNoise,
+    Bias,
     Drift,
     FeatureJitter,
     FrequencyMask,
     MagnitudeWarp,
     Scaling,
+    Smoothing,
     TemporalBlockMask,
     TemporalCrop,
 )
+from .base import Transform
+from .compose import Compose, OneOf, RandomApply
+from .registry import build_from_config
 
 __all__ = [
     "Transform",
@@ -21,11 +23,13 @@ __all__ = [
     "OneOf",
     "build_from_config",
     "Scaling",
+    "Bias",
     "Drift",
     "FeatureJitter",
     "AddGaussianNoise",
     "FrequencyMask",
     "MagnitudeWarp",
-    "TemporalCrop",
     "TemporalBlockMask",
+    "Smoothing",
+    "TemporalCrop",
 ]

@@ -263,11 +263,14 @@ class LeJEPA_SSL(nn.Module):
 
         inv_loss, temporal_alignment = self._compute_invariance_loss(inv_pool, anchor_index)
 
-        # 2. SIGReg regularization
-        if proj.dim() == 4:
-            z_sig = proj.view(-1, proj.shape[2], proj.shape[3])
+        # 2. SIGReg regularization — use only t0 views (skip prev views)
+        # Flattening all views (incl. correlated prev windows) inflates sample
+        # count and biases the marginal distribution estimate.
+        t0_proj = proj[:, self.num_prev_views:, ...]  # [B, V_t0, ...]
+        if t0_proj.dim() == 4:
+            z_sig = t0_proj.reshape(-1, t0_proj.shape[2], t0_proj.shape[3])
         else:
-            z_sig = proj.view(-1, proj.shape[-1])
+            z_sig = t0_proj.reshape(-1, t0_proj.shape[-1])
         sigreg_loss = self.sigreg(z_sig, global_step=global_step)
         
         # Compute embedding diagnostics (for monitoring collapse)

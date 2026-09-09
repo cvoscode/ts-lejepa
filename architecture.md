@@ -96,7 +96,7 @@ The framework follows the **JEPA (Joint Embedding Predictive Architecture)** phi
 │    total = ssl_loss + 0.1 * probe_loss                              │
 │                                                                     │
 │  Optimizer: AdamW, separate param groups for SSL & probe            │
-│  Callbacks: Checkpointing, LR monitoring, UMAP visualization       │
+│  Callbacks: Checkpointing, LR monitoring, PaCMAP visualization       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,7 +152,7 @@ src/timeseries/
 │   └── ray_tune_ssl.py    ← Ray Tune hyperparameter search
 │
 └── visualizations/
-    ├── callbacks.py       ← VisualizationCallback (UMAP, forecast plots)
+    ├── callbacks.py       ← VisualizationCallback (PaCMAP, forecast plots)
     └── datamodule.py      ← visualize_pems_tuple (view inspection)
 ```
 

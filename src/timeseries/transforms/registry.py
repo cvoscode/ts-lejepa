@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from typing import Callable
 
-from .base import Transform
-from .compose import Compose, OneOf, RandomApply
-from .ops import (
+from .augmenttime_ops import (
     AddGaussianNoise,
+    Bias,
     Drift,
     FeatureJitter,
     FrequencyMask,
     MagnitudeWarp,
     Scaling,
+    Smoothing,
     TemporalBlockMask,
     TemporalCrop,
 )
+from .base import Transform
+from .compose import Compose, OneOf, RandomApply
 
 
 _REGISTRY: dict[str, Callable[..., Transform]] = {
@@ -23,6 +25,7 @@ _REGISTRY: dict[str, Callable[..., Transform]] = {
     "RandomApply": RandomApply,
     "OneOf": OneOf,
     "Scaling": Scaling,
+    "Bias": Bias,
     "Drift": Drift,
     "FeatureJitter": FeatureJitter,
     "AddGaussianNoise": AddGaussianNoise,
@@ -30,6 +33,7 @@ _REGISTRY: dict[str, Callable[..., Transform]] = {
     "MagnitudeWarp": MagnitudeWarp,
     "TemporalCrop": TemporalCrop,
     "TemporalBlockMask": TemporalBlockMask,
+    "Smoothing": Smoothing,
 }
 
 

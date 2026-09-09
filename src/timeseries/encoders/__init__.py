@@ -13,7 +13,7 @@ from .tcn import TCNEncoder
 from .transformer import TransformerEncoder
 from .upernet import UPerNetEncoder
 from .mamba import MambaEncoder
-from .graphlstm import GraphLSTMEncoder
+#from .graphlstm import GraphLSTMEncoder
 from .covariate import CovariateEncoder, FusedEncoder, FutureCovariateEncoder
 
 __all__ = [
@@ -24,7 +24,7 @@ __all__ = [
     "TransformerEncoder",
     "UPerNetEncoder",
     "MambaEncoder",
-    "GraphLSTMEncoder",
+    #"GraphLSTMEncoder",
     "CovariateEncoder",
     "FusedEncoder",
     "FutureCovariateEncoder",

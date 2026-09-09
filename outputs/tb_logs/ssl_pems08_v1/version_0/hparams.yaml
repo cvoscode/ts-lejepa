@@ -1,0 +1,51 @@
+cfg:
+  window_size: 96
+  target_window_size: 12
+  stride: 6
+  batch_size: 32
+  num_workers: 2
+  train_split: 0.8
+  split_mode: temporal
+  split_seed: 0
+  augmentation_mode: compound
+  p_per_aug: 0.4
+  scale_range:
+  - 0.9
+  - 1.1
+  jitter_std: 0.05
+  p_noise: 0.3
+  p_freq_mask: 0.1
+  max_freq_ratio: 0.1
+  p_magnitude_warp: 0.3
+  p_temporal_mask: 0.3
+  p_temporal_crop: 0.0
+  crop_ratio_range:
+  - 0.85
+  - 1.0
+  repeat_factor: 4
+  repeat_factor_val: 4
+  include_prev: 1
+  prev_shift: 6
+  include_clean_t0: true
+  encoder_name: lstm
+  input_channels: 170
+  encoder_output_dim: 128
+  pool_mode: mean
+  lstm_hidden_channels: 64
+  lstm_layers: 2
+  lstm_dropout: 0.1
+  lstm_bidirectional: true
+  proj_dim: 64
+  proj_hidden: 512
+  lamb: 0.5
+  sigreg_slices: 512
+  sigreg_knots: 17
+  sigreg_seed: 0
+  p_t0: 0.9
+  p_tminus1: 0.1
+  sample_policy: at_least_one_tminus1
+  lr: 0.0005
+  weight_decay: 0.0001
+  probe_use: true
+  probe_loss_weight: 0.0
+data_path: null

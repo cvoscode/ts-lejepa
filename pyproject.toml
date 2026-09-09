@@ -18,13 +18,22 @@ dependencies = [
     "ray[tune]>=2.9.0",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
-    "tensorboard>=2.20.0",
+    "tensorboard>=2.21.0",
     "tensorboardx>=2.6.4",
     "torch-geometric>=2.7.0",
-    "umap-learn>=0.5.9.post2",
+    "pacmap>=0.9.1",
+    "omegaconf>=2.3.1",
+    "torch>=2.9.1",
+    "torchvision>=0.29.0",
+    "augmenttime",
 ]
+
+[tool.uv.sources]
+augmenttime = { path = "../augmenttime", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modules", "src/images", "src/timeseries"]
 
-
+ [tool.uv.extra-build-dependencies]
+torch-sparse = ["torch"]
+torch-scatter = ["torch"]

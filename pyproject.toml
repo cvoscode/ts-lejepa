@@ -26,10 +26,32 @@ dependencies = [
     "torch>=2.9.1",
     "torchvision>=0.29.0",
     "augmenttime",
+    # CUDA 13 runtime libraries — these are bundled as the cu130 torch wheel
+    # but the cu13 PyPI packages ship the cuDNN / NCCL / nvshmem / cusparseLt
+    # shared objects that torch loads at import time. They must be declared
+    # explicitly so `uv sync` does not strip them from the venv.
+    "nvidia-cudnn-cu13>=9.0",
+    "nvidia-cusparselt-cu13>=0.7",
+    "nvidia-nccl-cu13>=2.20",
+    "nvidia-nvshmem-cu13>=3.0",
+    "nvidia-cublas>=13.0",
+    "nvidia-cuda-nvrtc>=13.0",
+]
+
+[project.optional-dependencies]
+dashboards = ["aeroboard[lightning]"]
+dev = [
+    "pytest>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [tool.uv.sources]
 augmenttime = { path = "../augmenttime", editable = true }
+aeroboard = { path = "../aeroboard", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modules", "src/images", "src/timeseries"]

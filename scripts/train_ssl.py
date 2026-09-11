@@ -1,12 +1,19 @@
-"""Train LeJEPA SSL on PeMS08 with a strong config and TensorBoard logging.
+"""Train LeJEPA SSL on PeMS08 with a strong config and pluggable logging.
 
 Run:
     python scripts/train_ssl.py                # default: 10 epochs, 170 sensors
     python scripts/train_ssl.py --epochs 20 --batch 64 --channels 64
+    python scripts/train_ssl.py --logger aeroboard    # use Aeroboard dashboard
+    python scripts/train_ssl.py --logger both         # TensorBoard + Aeroboard
 
 TensorBoard logs land in: outputs/tb_logs/<run_name>/
 Launch TensorBoard with:
     tensorboard --logdir outputs/tb_logs
+
+Aeroboard logs require the optional `dashboards` extra:
+    uv sync --extra dashboards
+And a running Aeroboard server:
+    uv run aeroboard start
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from timeseries.preprocessing.time_encoding import encode_timestamps_torch
 from timeseries.ssl.lejepa import LeJEPA_SSL
 from timeseries.tasks.forecast_probe import ForecastProbe
 from timeseries.train.lightning_ssl import SSLPretrainModule
+from timeseries.visualizations.aeroboard_logger import build_aeroboard_logger
 
 
 def build_config(args: argparse.Namespace) -> OmegaConf:
@@ -92,6 +100,18 @@ def build_config(args: argparse.Namespace) -> OmegaConf:
         # Optim / schedule
         "lr": 5e-4,
         "weight_decay": 1e-4,
+        "scheduler": "cosine",
+        "warmup_epochs": 5,
+        "min_lr": 1e-6,
+        "gradient_clip_val": 0.5,
+        "gradient_clip_algorithm": "norm",
+
+        # Augmentation: per-view temporal crop + batch-level channel mixup
+        # (both new; see ``AugmentationViewBuilder.temporal_crop`` and
+        # ``BatchChannelMixup``). ``crop_ratio_range`` already enables the crop;
+        # ``channel_mixup_p`` switches the batch-level cross-sample mix on/off.
+        "channel_mixup_p": 0.3,
+        "channel_mixup_max_channels": None,
 
         # Probe (eval-only head, helps monitor downstream utility)
         "probe_use": True,
@@ -161,6 +181,29 @@ def main() -> None:
     p.add_argument("--max-steps", type=int, default=-1, help="Cap optimizer steps for quick smoke runs.")
     p.add_argument("--run-name", type=str, default="ssl_pems08")
     p.add_argument("--ckpt-dir", type=str, default="outputs/checkpoints")
+    p.add_argument(
+        "--logger",
+        type=str,
+        choices=["tb", "aeroboard", "both"],
+        default="tb",
+        help=(
+            "Logger backend(s) to use. 'tb' = TensorBoardLogger (default), "
+            "'aeroboard' = AeroboardLightningLogger (requires `uv sync --extra dashboards`), "
+            "'both' = run both in parallel."
+        ),
+    )
+    p.add_argument(
+        "--aeroboard-url",
+        type=str,
+        default="grpc://localhost:50051",
+        help="Aeroboard Arrow Flight endpoint.",
+    )
+    p.add_argument(
+        "--aeroboard-api",
+        type=str,
+        default=None,
+        help="Aeroboard HTTP API base URL (optional).",
+    )
     args = p.parse_args()
 
     L.seed_everything(args.seed)
@@ -199,17 +242,53 @@ def main() -> None:
         weight_decay=float(cfg.weight_decay),
         probe=probe,
         probe_loss_weight=float(cfg.probe_loss_weight),
-        scheduler="cosine",
-        warmup_epochs=2,
-        min_lr=1e-6,
+        scheduler=str(getattr(cfg, "scheduler", "cosine")),
+        warmup_epochs=int(getattr(cfg, "warmup_epochs", 5)),
+        min_lr=float(getattr(cfg, "min_lr", 1e-6)),
+        gradient_clip_val=float(getattr(cfg, "gradient_clip_val", 0.5)),
+        gradient_clip_algorithm=str(getattr(cfg, "gradient_clip_algorithm", "norm")),
     )
 
     # Logger + callbacks
-    tb_logger = TensorBoardLogger(
-        save_dir=str(ROOT / "outputs" / "tb_logs"),
-        name=args.run_name,
-        default_hp_metric=False,
-    )
+    loggers: list = []
+    tb_logger = None
+    if args.logger in ("tb", "both"):
+        tb_logger = TensorBoardLogger(
+            save_dir=str(ROOT / "outputs" / "tb_logs"),
+            name=args.run_name,
+            default_hp_metric=False,
+        )
+        loggers.append(tb_logger)
+    if args.logger in ("aeroboard", "both"):
+        aero_logger = build_aeroboard_logger(
+            run_id=args.run_name,
+            url=args.aeroboard_url,
+            api_base_url=args.aeroboard_api,
+        )
+        if aero_logger is not None:
+            loggers.append(aero_logger)
+        else:
+            print(
+                "[train_ssl] WARNING: --logger=aeroboard requested but "
+                "aeroboard-client is not installed; falling back to TB only."
+            )
+            if not loggers:
+                # Re-add TB if it was skipped (e.g. --logger=aeroboard with no extra).
+                tb_logger = TensorBoardLogger(
+                    save_dir=str(ROOT / "outputs" / "tb_logs"),
+                    name=args.run_name,
+                    default_hp_metric=False,
+                )
+                loggers.append(tb_logger)
+    if not loggers:
+        loggers.append(
+            TensorBoardLogger(
+                save_dir=str(ROOT / "outputs" / "tb_logs"),
+                name=args.run_name,
+                default_hp_metric=False,
+            )
+        )
+
     ckpt_cb = L.pytorch.callbacks.ModelCheckpoint(
         dirpath=str(ROOT / args.ckpt_dir / args.run_name),
         filename="ssl-{epoch:02d}-{val/ssl_loss:.4f}",
@@ -226,15 +305,22 @@ def main() -> None:
         accelerator="auto",
         devices=1,
         precision=args.precision if args.precision in (16, 32) else "16-mixed",
-        logger=tb_logger,
+        logger=loggers,
         callbacks=[ckpt_cb, lr_cb],
         log_every_n_steps=10,
-        gradient_clip_val=1.0,
+        # Gradient clipping: SIGReg can spike early in training. The module
+        # also enforces its own fallback clip (``gradient_clip_val`` on
+        # ``SSLPretrainModule``) but it's cleaner to set it once on the
+        # Trainer. Both routes converge to the same value via cfg.
+        gradient_clip_val=float(getattr(cfg, "gradient_clip_val", 0.5)),
+        gradient_clip_algorithm=str(getattr(cfg, "gradient_clip_algorithm", "norm")),
         enable_progress_bar=True,
         check_val_every_n_epoch=1,
     )
 
-    print(f"[train_ssl] TensorBoard logdir: {tb_logger.log_dir}")
+    if tb_logger is not None:
+        print(f"[train_ssl] TensorBoard logdir: {tb_logger.log_dir}")
+    print(f"[train_ssl] active loggers: {[type(l).__name__ for l in loggers]}")
     trainer.fit(model, datamodule=datamodule)
 
     print(f"[train_ssl] done. best ckpt: {ckpt_cb.best_model_path}")

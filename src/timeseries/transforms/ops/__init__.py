@@ -17,6 +17,7 @@ from ..augmenttime_ops import (
     TemporalBlockMask,
     TemporalCrop,
 )
+from .channel_mixup import ChannelMixup
 
 __all__ = [
     "Scaling",
@@ -29,4 +30,5 @@ __all__ = [
     "TemporalBlockMask",
     "Smoothing",
     "TemporalCrop",
+    "ChannelMixup",
 ]

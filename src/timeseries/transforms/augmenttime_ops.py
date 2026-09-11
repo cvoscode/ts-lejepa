@@ -234,19 +234,69 @@ class Drift(Transform):
 
 
 class TemporalCrop(Transform):
-    """Deprecated: temporal crop was removed when switching to augmenttime.
-    Kept as an identity transform for import compatibility.
+    """Random temporal crop + right-pad back to the original length.
+
+    This is a view-level op (different crop per view) and is the strongest
+    single TS-SSL augmentation: it forces the encoder to be invariant to
+    time alignment, which is exactly what forecasting requires.
+
+    Args:
+        output_length: Target length. The crop is drawn from
+            ``[output_length, output_length * crop_ratio_range[1]]`` along
+            time. The output is right-padded with the last value to keep the
+            shape ``[C, output_length]`` (or ``[B, C, output_length]``).
+        crop_ratio_range: ``(min_ratio, max_ratio)``. The crop length is
+            ``output_length * ratio`` where ``ratio`` is uniform in the range.
+            A range of ``(1.0, 1.0)`` is a no-op.
     """
 
     def __init__(
         self,
-        output_length: int,  # noqa: ARG002
-        crop_ratio_range: tuple[float, float] = (0.8, 1.0),  # noqa: ARG002
+        output_length: int,
+        crop_ratio_range: tuple[float, float] = (0.85, 1.0),
     ) -> None:
-        pass
+        self.output_length = int(output_length)
+        lo, hi = crop_ratio_range
+        if not (0.0 < lo <= hi <= 1.0):
+            raise ValueError(
+                f"crop_ratio_range must satisfy 0 < lo <= hi <= 1, got {crop_ratio_range}"
+            )
+        self.crop_ratio_range = (float(lo), float(hi))
+
+    def _sample_ratio(self) -> float:
+        import random
+        lo, hi = self.crop_ratio_range
+        if hi <= lo:
+            return lo
+        return random.uniform(lo, hi)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        squeeze = x.dim() == 2
+        if squeeze:
+            x = x.unsqueeze(0)
+        if x.dim() != 3:
+            raise ValueError(f"TemporalCrop expects 2D or 3D input, got {x.dim()}D")
+
+        B, C, T = x.shape
+        if T != self.output_length:
+            # Crop is anchored to the configured output length; if the incoming
+            # tensor doesn't match (e.g. already-cropped view) we resize by
+            # random slicing and skip the right-pad.
+            ratio = self._sample_ratio()
+            new_len = max(1, int(round(T * ratio)))
+            start = int(torch.randint(0, T - new_len + 1, (1,)).item()) if T > new_len else 0
+            return x[:, :, start : start + new_len].contiguous()
+
+        ratio = self._sample_ratio()
+        new_len = max(1, int(round(T * ratio)))
+        start = int(torch.randint(0, T - new_len + 1, (1,)).item())
+        cropped = x[:, :, start : start + new_len]
+        # Right-pad with the last column to keep shape [B, C, output_length].
+        pad_len = self.output_length - new_len
+        if pad_len > 0:
+            pad = cropped[:, :, -1:].expand(-1, -1, pad_len)
+            cropped = torch.cat([cropped, pad], dim=-1)
+        return cropped.squeeze(0) if squeeze else cropped
 
 
 # Re-exported so ``from timeseries.transforms.ops import F`` keeps working.

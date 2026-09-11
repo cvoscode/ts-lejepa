@@ -41,6 +41,12 @@ class SSLPretrainModule(L.LightningModule):
         scheduler: str = "cosine",  # 'cosine' or 'none'
         warmup_epochs: int = 5,
         min_lr: float = 1e-6,
+        # Gradient clipping. SIGReg can spike early in training, so we keep a
+        # tighter norm-clip than the Lightning default of 0. 0.5 is the safe
+        # default; bump to 1.0 if you see loss-of-signal at the cost of more
+        # occasional spikes.
+        gradient_clip_val: float = 0.5,
+        gradient_clip_algorithm: str = "norm",
     ) -> None:
         super().__init__()
         self.ssl_core = ssl_core
@@ -58,6 +64,13 @@ class SSLPretrainModule(L.LightningModule):
         self.scheduler_type = str(scheduler)
         self.warmup_epochs = int(warmup_epochs)
         self.min_lr = float(min_lr)
+        # Gradient clipping. Persisted as hparams so Lightning restores them
+        # on checkpoint resume.
+        self.gradient_clip_val = float(gradient_clip_val)
+        self.gradient_clip_algorithm = str(gradient_clip_algorithm)
+        # If the Trainer hasn't been told to clip, we still want the safer
+        # default to be active. We expose a hook below.
+        self._clip_logged = False
 
         torch.set_float32_matmul_precision('medium')
 
@@ -69,6 +82,68 @@ class SSLPretrainModule(L.LightningModule):
         if self.global_step < self.probe_start_step:
             return False
         return True
+
+    def on_train_start(self) -> None:
+        """Verify that the Trainer's gradient-clip setting matches the module's.
+
+        SIGReg can spike early in training; we want a tight norm-clip
+        (``gradient_clip_val=0.5`` by default). If the user instantiates the
+        ``Trainer`` without specifying a clip, fall back to the module's value
+        so the safer default always wins.
+        """
+        if self._clip_logged:
+            return
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        # Lightning stores the configured clip on the trainer. ``0`` means "no
+        # clipping"; in that case we leave a warning and let the module-level
+        # gradient_clip_val guide our own manual clip below.
+        configured = getattr(trainer, "gradient_clip_val", 0)
+        if configured in (None, 0):
+            import warnings
+            warnings.warn(
+                f"Trainer has no gradient_clip_val; SSLPretrainModule will "
+                f"apply its own clip={self.gradient_clip_val} "
+                f"({self.gradient_clip_algorithm}). Pass "
+                f"gradient_clip_val={self.gradient_clip_val} to the Trainer "
+                "explicitly to silence this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            self.log("config/gradient_clip_val", float(configured), prog_bar=False)
+        self._clip_logged = True
+
+    def on_after_backward(self) -> None:
+        """Fallback gradient clipping when the Trainer didn't enable it.
+
+        This is a no-op when the Trainer already does the clip — Lightning's
+        clip runs after ``on_after_backward`` and overrides whatever we did.
+        When the Trainer has ``gradient_clip_val=0`` we still want our safer
+        default to be active.
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        configured = getattr(trainer, "gradient_clip_val", 0)
+        if configured not in (None, 0):
+            return
+        if not torch.is_grad_enabled():
+            return
+        clip_val = float(self.gradient_clip_val)
+        if clip_val <= 0:
+            return
+        if self.gradient_clip_algorithm == "norm":
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.parameters() if p.requires_grad],
+                clip_val,
+            )
+        else:  # "value"
+            torch.nn.utils.clip_grad_value_(
+                [p for p in self.parameters() if p.requires_grad],
+                clip_val,
+            )
 
     def training_step(self, batch: Batch, batch_idx: int):
         """Compute SSL loss and log probe metrics if targets are present."""

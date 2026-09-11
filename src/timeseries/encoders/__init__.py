@@ -15,6 +15,7 @@ from .upernet import UPerNetEncoder
 from .mamba import MambaEncoder
 #from .graphlstm import GraphLSTMEncoder
 from .covariate import CovariateEncoder, FusedEncoder, FutureCovariateEncoder
+from .layers import ChannelMixer, TimeFeatureFiLM, TimeFeatureProjector
 
 __all__ = [
     "LSTMEncoder",
@@ -28,4 +29,7 @@ __all__ = [
     "CovariateEncoder",
     "FusedEncoder",
     "FutureCovariateEncoder",
+    "TimeFeatureProjector",
+    "TimeFeatureFiLM",
+    "ChannelMixer",
 ]

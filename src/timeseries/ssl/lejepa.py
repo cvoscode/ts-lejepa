@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from ..core.types import InvarianceMix
-from .regularizers import TemporalSIGReg
+from .regularizers import TemporalSIGReg, RDMReg, Link
 
 
 @dataclass
@@ -75,6 +75,17 @@ class LeJEPA_SSL(nn.Module):
         sigreg_seed: int = 0,
         # Improved invariance options
         use_anchor_invariance: bool = True,  # Use clean t0 as anchor instead of mean
+        # Sparse / rectified representation (LpWM-compatible)
+        regularizer_kind: str = "sigreg",
+        #   "sigreg" -> TemporalSIGReg (Epps-Pulley to isotropic Gaussian).
+        #   "rdmreg" -> RDMReg (sliced-Wasserstein-2 to GN_p target, link-aware).
+        proj_link: str = "identity",
+        #   "identity" / "relu" / "reprelu". Applied to z_sig before the
+        #   regularizer; also applied to the GN_p target so the loss is
+        #   self-consistent.
+        rdmreg_target_p: float = 2.0,
+        rdmreg_num_projections: int = 1024,
+        rdmreg_mu: float = 0.0,
     ) -> None:
         """Initialize SSL core.
 
@@ -103,9 +114,24 @@ class LeJEPA_SSL(nn.Module):
         
         # Index of the clean t0 view (first t0 view after previous views)
         self.clean_t0_index = self.num_prev_views
-        
+
+        # Architectural link h(.) selecting the representation space. Applied
+        # to features before the regularizer and to the regularizer's target
+        # so the loss is self-consistent (sparse representation + rectified-GG
+        # target -> LpWM recipe).
+        self.link = Link(kind=proj_link)
+
         if regularizer is not None:
             self.sigreg = regularizer
+            self.regularizer_kind = "custom"
+        elif regularizer_kind == "rdmreg":
+            self.sigreg = RDMReg(
+                feature_dim=proj_dim,
+                target_p=rdmreg_target_p,
+                num_projections=rdmreg_num_projections,
+                mu=rdmreg_mu,
+            )
+            self.regularizer_kind = "rdmreg"
         else:
             self.sigreg = TemporalSIGReg(
                 feature_dim=proj_dim,
@@ -113,6 +139,7 @@ class LeJEPA_SSL(nn.Module):
                 knots=sigreg_knots,
                 seed=sigreg_seed,
             )
+            self.regularizer_kind = "sigreg"
 
     def _encode(self, views: torch.Tensor, view_times: Optional[torch.Tensor]) -> torch.Tensor:
         """Encode batched views with optional time features."""
@@ -263,7 +290,7 @@ class LeJEPA_SSL(nn.Module):
 
         inv_loss, temporal_alignment = self._compute_invariance_loss(inv_pool, anchor_index)
 
-        # 2. SIGReg regularization — use only t0 views (skip prev views)
+        # 2. Regularization — use only t0 views (skip prev views).
         # Flattening all views (incl. correlated prev windows) inflates sample
         # count and biases the marginal distribution estimate.
         t0_proj = proj[:, self.num_prev_views:, ...]  # [B, V_t0, ...]
@@ -271,7 +298,15 @@ class LeJEPA_SSL(nn.Module):
             z_sig = t0_proj.reshape(-1, t0_proj.shape[2], t0_proj.shape[3])
         else:
             z_sig = t0_proj.reshape(-1, t0_proj.shape[-1])
-        sigreg_loss = self.sigreg(z_sig, global_step=global_step)
+        # Apply the architectural link h(.) to features before matching the
+        # distribution. For "identity" link this is a no-op; for "relu"/"reprelu"
+        # the regularizer's GN_p target is also link-transformed inside
+        # RDMReg.forward so the loss is self-consistent.
+        z_sig_linked = self.link(z_sig)
+        if self.regularizer_kind == "rdmreg":
+            sigreg_loss = self.sigreg(z_sig_linked, link=self.link)
+        else:
+            sigreg_loss = self.sigreg(z_sig_linked, global_step=global_step)
         
         # Compute embedding diagnostics (for monitoring collapse)
         with torch.no_grad():

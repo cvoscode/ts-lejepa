@@ -14,6 +14,7 @@ from omegaconf import DictConfig
 from ..data.window_dataset import WindowDataset
 from ..data.view_dataset import ViewDataset, collate_batches
 from ..data.view_builders import AugmentationViewBuilder
+from .pems import _resolve_temporal_crop_ratio
 from ..transforms.base import Transform
 from ..transforms.compose import Compose, RandomApply
 from ..transforms.ops import (
@@ -231,11 +232,26 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
 
         include_clean_t0 = bool(cfg.get("include_clean_t0", True))
 
+        # Per-view temporal crop: strongest single TS-SSL augmentation.
+        # Disabled when the ratio range is (1.0, 1.0). We prefer the new
+        # ``temporal_crop_ratio_range`` key to avoid colliding with the legacy
+        # amplitude-style ``crop_ratio_range`` (e.g. ``(0.8, 1.2)``); we fall
+        # back to ``crop_ratio_range`` only when it actually looks like a ratio.
+        crop_ratio = _resolve_temporal_crop_ratio(cfg)
+        temporal_crop = None
+        if crop_ratio is not None and crop_ratio != (1.0, 1.0):
+            from ..transforms.ops import TemporalCrop
+            temporal_crop = TemporalCrop(
+                output_length=int(cfg.get("window_size", 96)),
+                crop_ratio_range=crop_ratio,
+            )
+
         view_builder = AugmentationViewBuilder(
             transform=self.transform,
             repeat_factor=int(repeat_factor),
             num_prev=include_prev,
             include_clean_t0=include_clean_t0,
+            temporal_crop=temporal_crop,
         )
 
         return ViewDataset(window_ds, view_builder)
@@ -320,13 +336,39 @@ class TimeSeriesSSLDataModule(L.LightningDataModule):
         self.train_ds = self._make_view_dataset(train_scaled_ct, train_time, repeat_factor=repeat_factor_train)
         self.val_ds = self._make_view_dataset(val_scaled_ct, val_time, repeat_factor=repeat_factor_val)
 
+    def _build_collate_fn(self):
+        """Compose ``collate_batches`` with optional batch-level channel mixup.
+
+        Channel mixup is applied after collation so it can swap channels
+        across samples in the same batch. Gated by ``cfg['channel_mixup_p']``.
+        Val is never mixed.
+
+        The clean t0 index used as the partner pool is ``cfg['include_prev']``.
+        """
+        from .view_dataset import BatchChannelMixup
+        p = float(self.cfg.get("channel_mixup_p", 0.0))
+        if p <= 0.0:
+            return collate_batches
+        max_channels = self.cfg.get("channel_mixup_max_channels", None)
+        try:
+            max_channels = int(max_channels) if max_channels is not None else None
+        except (TypeError, ValueError):
+            max_channels = None
+        clean_t0_idx = int(self.cfg.get("include_prev", 0) or 0)
+        mixup = BatchChannelMixup(p=p, max_channels=max_channels, clean_t0_index=clean_t0_idx)
+
+        def _collate(items):
+            return mixup(collate_batches(items))
+
+        return _collate
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_ds,
             batch_size=int(self.cfg.get("batch_size", 32)),
             shuffle=True,
             num_workers=int(self.cfg.get("num_workers", 0)),
-            collate_fn=collate_batches,
+            collate_fn=self._build_collate_fn(),
         )
 
     def val_dataloader(self) -> DataLoader:

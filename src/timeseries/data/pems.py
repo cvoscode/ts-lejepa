@@ -36,6 +36,51 @@ class IdentityTransform(Transform):
         return x
 
 
+def _resolve_temporal_crop_ratio(cfg) -> tuple[float, float] | None:
+    """Return the temporal-crop ratio range from ``cfg`` or ``None``.
+
+    The legacy ``crop_ratio_range`` key was overloaded: in some configs it
+    is a temporal-crop ratio like ``(0.85, 1.0)``, in others it is an
+    amplitude range like ``(0.8, 1.2)`` used by the old augmenttime
+    amplitude-scaling op. The two cannot both be supported under the same
+    name, so we introduce a dedicated ``temporal_crop_ratio_range`` key and
+    fall back to ``crop_ratio_range`` only when it actually looks like a
+    valid ratio (both endpoints in ``(0, 1]``).
+
+    Returns ``None`` when the crop should be disabled.
+    """
+    def _as_pair(x):
+        try:
+            lo, hi = float(x[0]), float(x[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        return lo, hi
+
+    explicit = getattr(cfg, "temporal_crop_ratio_range", None)
+    if explicit is not None:
+        pair = _as_pair(explicit)
+        if pair is None:
+            return None
+        lo, hi = pair
+        if not (0.0 < lo <= hi <= 1.0):
+            return None  # invalid; fall back to legacy only if also invalid
+        return pair
+
+    legacy = getattr(cfg, "crop_ratio_range", None)
+    if legacy is None:
+        return None
+    pair = _as_pair(legacy)
+    if pair is None:
+        return None
+    lo, hi = pair
+    # Only treat the legacy value as a crop ratio if it is bounded by 1.0.
+    # An amplitude range like (0.8, 1.2) is rejected silently (returns None)
+    # and the crop is disabled — better than crashing on a stale config.
+    if not (0.0 < lo <= hi <= 1.0):
+        return None
+    return pair
+
+
 def build_ssl_transform(
     *,
     output_length: int,
@@ -243,12 +288,28 @@ class PeMS08SSLDataModule(L.LightningDataModule):
 
         # Always include clean t0 for proper probe training
         include_clean_t0 = bool(getattr(self.cfg, "include_clean_t0", True))
-        
+
+        # Per-view temporal crop: strongest single TS-SSL augmentation.
+        # Disabled when the ratio range is (1.0, 1.0). We prefer the new
+        # ``temporal_crop_ratio_range`` key to avoid colliding with the legacy
+        # amplitude-style ``crop_ratio_range`` (e.g. ``(0.8, 1.2)`` in older
+        # notebooks); if that key is missing or invalid as a ratio, fall back
+        # to ``crop_ratio_range`` only when it actually looks like a ratio.
+        crop_ratio = _resolve_temporal_crop_ratio(self.cfg)
+        temporal_crop = None
+        if crop_ratio is not None and crop_ratio != (1.0, 1.0):
+            from ..transforms.ops import TemporalCrop
+            temporal_crop = TemporalCrop(
+                output_length=int(self.cfg.window_size),
+                crop_ratio_range=crop_ratio,
+            )
+
         view_builder = AugmentationViewBuilder(
             transform=self.transform,
             repeat_factor=int(repeat_factor),
             num_prev=include_prev,
             include_clean_t0=include_clean_t0,
+            temporal_crop=temporal_crop,
         )
 
         return ViewDataset(window_ds, view_builder)
@@ -373,13 +434,41 @@ class PeMS08SSLDataModule(L.LightningDataModule):
         self.train_ds = self._make_view_dataset(train_scaled_ct, train_time, repeat_factor=repeat_factor_train)
         self.val_ds = self._make_view_dataset(val_scaled_ct, val_time, repeat_factor=repeat_factor_val)
 
+    def _build_collate_fn(self):
+        """Compose ``collate_batches`` with optional batch-level channel mixup.
+
+        Channel mixup is applied after collation so it can swap channels
+        across samples in the same batch. It is gated by ``cfg.channel_mixup_p``
+        (set to 0.0 to disable). Val is never mixed.
+
+        The clean t0 index used as the partner pool is ``cfg.include_prev``
+        (the view builder places the clean t0 immediately after the
+        ``include_prev`` augmented t-1 views).
+        """
+        from .view_dataset import BatchChannelMixup
+        p = float(getattr(self.cfg, "channel_mixup_p", 0.0))
+        if p <= 0.0:
+            return collate_batches
+        max_channels = getattr(self.cfg, "channel_mixup_max_channels", None)
+        try:
+            max_channels = int(max_channels) if max_channels is not None else None
+        except (TypeError, ValueError):
+            max_channels = None
+        clean_t0_idx = int(getattr(self.cfg, "include_prev", 0) or 0)
+        mixup = BatchChannelMixup(p=p, max_channels=max_channels, clean_t0_index=clean_t0_idx)
+
+        def _collate(items):
+            return mixup(collate_batches(items))
+
+        return _collate
+
     def train_dataloader(self):
         return DataLoader(
             self.train_ds,
             batch_size=self.cfg.batch_size,
             shuffle=True,
             num_workers=getattr(self.cfg, "num_workers", 0),
-            collate_fn=collate_batches,
+            collate_fn=self._build_collate_fn(),
         )
 
     def val_dataloader(self):
@@ -388,7 +477,7 @@ class PeMS08SSLDataModule(L.LightningDataModule):
             batch_size=self.cfg.batch_size,
             shuffle=False,  # Validation must not shuffle for reproducible metrics
             num_workers=getattr(self.cfg, "num_workers", 0),
-            collate_fn=collate_batches,
+            collate_fn=collate_batches,  # Val never gets channel mixup
         )
 
 

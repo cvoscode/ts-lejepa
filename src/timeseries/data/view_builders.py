@@ -7,6 +7,9 @@ from typing import Optional
 
 import torch
 
+from ..transforms.base import Transform
+from ..transforms.ops import TemporalCrop
+
 
 @dataclass
 class AugmentationViewBuilder:
@@ -14,7 +17,7 @@ class AugmentationViewBuilder:
 
     View structure (with num_prev=2, repeat_factor=10):
         [t-1_aug1, t-1_aug2, t0_clean, t0_aug1, t0_aug2, ..., t0_aug10]
-        
+
     Key design:
         1. Previous views are num_prev AUGMENTED copies of the t-1 window only.
            This removes implicit time ordering (t-2, t-3, etc.) from the views,
@@ -22,7 +25,18 @@ class AugmentationViewBuilder:
            of temporal dynamics.
         2. First t0 view is CLEAN (unaugmented) for probe training
         3. Remaining t0 views are augmented for SSL invariance learning
-        
+
+    Per-view augmentations (``TemporalCrop``) are applied INSIDE the loop so
+    each augmented view sees a different temporal alignment — this is the
+    strongest single TS-SSL augmentation and must NOT be a single global
+    Compose pass (that would produce the same crop for every view of the
+    same window).
+
+    Channel-mixup (cross-sample channel swapping) is NOT done here because
+    the builder operates on one window at a time. It is applied at the collate
+    level in :mod:`timeseries.data.view_dataset` where the whole batch is
+    available. See :class:`~timeseries.data.view_dataset.BatchChannelMixup`.
+
     The probe should use index `num_prev` (the clean t0 view).
     SSL invariance uses all views but benefits from clean t0 anchor.
     """
@@ -32,11 +46,17 @@ class AugmentationViewBuilder:
     num_prev: int = 0  # Number of augmented t-1 views to include
     include_clean_t0: bool = True  # Whether to include a clean t0 view for probe
     prev_transform: Optional[torch.nn.Module] = None  # Optional separate transform for prev views
+    # Per-view temporal crop applied independently to every augmented t0 view.
+    # Strongly recommended for forecasting-oriented SSL. Set ``output_length`` to
+    # the SSL window size (e.g. 96). Set ``crop_ratio_range=(1.0, 1.0)`` to disable.
+    temporal_crop: Optional[TemporalCrop] = None
+    # Per-view temporal crop for the previous (t-1) views, applied independently.
+    prev_temporal_crop: Optional[TemporalCrop] = None
 
     @property
     def clean_t0_index(self) -> int:
         """Index of the clean t0 view in the view tensor.
-        
+
         Returns num_prev (the first t0 view after all previous views).
         """
         return self.num_prev
@@ -48,6 +68,23 @@ class AugmentationViewBuilder:
         if self.include_clean_t0:
             return base + 1
         return base
+
+    def _apply_view_transform(
+        self,
+        window: torch.Tensor,
+        *,
+        crop: Optional[TemporalCrop] = None,
+    ) -> torch.Tensor:
+        """Apply the global transform + optional per-view temporal crop.
+
+        Both are applied with shape ``[1, C, T]`` to match the SSL contract.
+        The crop is applied AFTER the value-space augmentations so each
+        augmented view is independently time-aligned.
+        """
+        view = self.transform(window.clone().unsqueeze(0)).squeeze(0)  # [C, T]
+        if crop is not None:
+            view = crop(view)
+        return view
 
     def build_views(
         self,
@@ -62,7 +99,7 @@ class AugmentationViewBuilder:
         View order:
             [t-1_aug1, ..., t-1_augN, t0_clean, t0_aug1, ..., t0_augR]
             where N = num_prev, R = repeat_factor
-            
+
         Previous views are all augmented copies of the SAME t-1 window.
         This avoids implicit time encoding from t-2, t-3, etc.
         The clean t0 view is at index `num_prev` for easy probe access.
@@ -74,8 +111,8 @@ class AugmentationViewBuilder:
         if self.repeat_factor < 1:
             raise ValueError("repeat_factor must be >= 1")
 
-        views_list = []
-        view_times_list = []
+        views_list: list[torch.Tensor] = []
+        view_times_list: list[torch.Tensor] = []
 
         # 1. Add num_prev AUGMENTED copies of the t-1 window
         #    Only uses the most recent previous window (t-1) and creates
@@ -83,15 +120,17 @@ class AugmentationViewBuilder:
         if self.num_prev > 0:
             if prev_windows is None or len(prev_windows) < 1:
                 raise ValueError(f"num_prev={self.num_prev} requires at least 1 prev_window (t-1)")
-            
+
             # Use only the t-1 window (index 0 in prev_windows list)
             t_minus_1 = prev_windows[0]
             aug_transform = self.prev_transform if self.prev_transform is not None else self.transform
-            
+
             for _ in range(self.num_prev):
-                prev_view = aug_transform(t_minus_1.clone().unsqueeze(0)).squeeze(0)  # [C, T]
+                prev_view = aug_transform(t_minus_1.clone().unsqueeze(0)).squeeze(0)
+                if self.prev_temporal_crop is not None:
+                    prev_view = self.prev_temporal_crop(prev_view)
                 views_list.append(prev_view.unsqueeze(0))  # [1, C, T]
-                
+
                 if time_features is not None:
                     if prev_time_features is None or len(prev_time_features) < 1:
                         raise ValueError(
@@ -101,28 +140,28 @@ class AugmentationViewBuilder:
                     # All t-1 augmented views share the same t-1 time features
                     prev_times = prev_time_features[0].unsqueeze(0)
                     view_times_list.append(prev_times)
-        
+
         # 2. Add CLEAN t0 view (unaugmented) for probe training
         #    This is the ground truth embedding the probe should learn from
         if self.include_clean_t0:
             clean_t0 = window.clone().unsqueeze(0)  # [1, C, T]
             views_list.append(clean_t0)
-            
+
             if time_features is not None:
                 clean_t0_times = time_features.unsqueeze(0)  # [1, T, F]
                 view_times_list.append(clean_t0_times)
-        
+
         # 3. Add AUGMENTED t0 views for SSL invariance learning
         #    Apply transforms individually per view to ensure each gets a unique
         #    random augmentation (batch-applying would apply the same random choice
         #    to all views, reducing view diversity).
         if self.repeat_factor > 0:
             t0_augmented = torch.stack([
-                self.transform(window.clone().unsqueeze(0)).squeeze(0)
+                self._apply_view_transform(window, crop=self.temporal_crop)
                 for _ in range(self.repeat_factor)
             ])  # [R, C, T]
             views_list.append(t0_augmented)
-            
+
             if time_features is not None:
                 # Time features are static across augmented views of same window
                 t0_times = time_features.unsqueeze(0).repeat(self.repeat_factor, 1, 1)  # [R, T, F]
@@ -130,7 +169,7 @@ class AugmentationViewBuilder:
 
         # Concatenate all views
         views = torch.cat(views_list, dim=0)
-        
+
         if not view_times_list:
             final_times = None
         else:

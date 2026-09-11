@@ -14,6 +14,7 @@ from .augmenttime_ops import (
 )
 from .base import Transform
 from .compose import Compose, OneOf, RandomApply
+from .ops.channel_mixup import ChannelMixup
 from .registry import build_from_config
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "TemporalBlockMask",
     "Smoothing",
     "TemporalCrop",
+    "ChannelMixup",
 ]

@@ -18,6 +18,7 @@ from .augmenttime_ops import (
 )
 from .base import Transform
 from .compose import Compose, OneOf, RandomApply
+from .ops.channel_mixup import ChannelMixup
 
 
 _REGISTRY: dict[str, Callable[..., Transform]] = {
@@ -34,6 +35,7 @@ _REGISTRY: dict[str, Callable[..., Transform]] = {
     "TemporalCrop": TemporalCrop,
     "TemporalBlockMask": TemporalBlockMask,
     "Smoothing": Smoothing,
+    "ChannelMixup": ChannelMixup,
 }
 
 
